@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/confmap/confmaptest"
 	"go.opentelemetry.io/collector/connector/connectortest"
 	"go.opentelemetry.io/collector/consumer/consumertest"
@@ -73,6 +74,34 @@ func TestVLLMRuleFile(t *testing.T) {
 		optional("enable_prefix_caching", `, enable_prefix_caching=(?P<v>True|False|None),`),
 		optional("speculative_method", `speculative_config=(?:SpeculativeConfig\\(method=')?(?P<v>None|[^',)]+)`),
 	}, rule.Attributes)
+}
+
+// TestREADMEExample checks that the example in README.md is a valid
+// configuration and that its rule is the one in testdata/vllm_rule.yaml.
+func TestREADMEExample(t *testing.T) {
+	readme, err := os.ReadFile("README.md")
+	require.NoError(t, err)
+	_, after, ok := strings.Cut(string(readme), "\n## Example\n")
+	require.True(t, ok, "README.md has an Example section")
+	_, after, ok = strings.Cut(after, "```yaml\n")
+	require.True(t, ok, "the Example section has a YAML block")
+	example, _, ok := strings.Cut(after, "```")
+	require.True(t, ok, "the YAML block is closed")
+
+	var raw map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte(example), &raw))
+	sub, err := confmap.NewFromStringMap(raw).Sub("connectors::" + TypeStr + "/vllm")
+	require.NoError(t, err)
+	cfg := createDefaultConfig().(*Config)
+	require.NoError(t, sub.Unmarshal(cfg))
+	require.NoError(t, cfg.Validate())
+
+	require.NotNil(t, cfg.Storage)
+	assert.Equal(t, "file_storage/state", cfg.Storage.String())
+	assert.Equal(t, 30*time.Second, cfg.EmitInterval)
+	want := loadVLLMRuleFile(t)
+	assert.Equal(t, want.IdentityOutputPrefix, cfg.IdentityOutputPrefix)
+	assert.Equal(t, want.Rules, cfg.Rules)
 }
 
 // fixture is one file of testdata/vllm, a container log in CRI format.
@@ -216,8 +245,8 @@ func assertGolden(t *testing.T, want, got []goldenSeries) {
 	}
 }
 
-// TestVLLMGolden runs the PoC fixtures through the vLLM rule and compares
-// the emitted series with testdata/vllm_golden.yaml.
+// TestVLLMGolden runs the container logs in testdata/vllm through the vLLM
+// rule and compares the emitted series with testdata/vllm_golden.yaml.
 func TestVLLMGolden(t *testing.T) {
 	golden := loadGolden(t)
 	fixtures := loadFixtures(t)

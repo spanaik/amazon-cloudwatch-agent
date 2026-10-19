@@ -30,8 +30,8 @@ The connector does not change the logs that it consumes. Thus, it can share a lo
 | `storage`                | ID of a storage extension that persists the state, for example `file_storage/state`. If not set, the state is in memory only.      | not set           |                                         |
 | `emit_interval`          | Time between two emissions of the current Info metrics. Rules can override it.                                                      | `60s`             | `1s` to `24h`                           |
 | `emit_on_change`         | If `true`, a change of facts causes an immediate emission of the Info metric.                                                       | `true`            |                                         |
-| `max_state_bytes`        | Maximum size of the serialized state.                                                                                               | `1048576` (1 MiB) | `65536` (64 KiB) to `67108864` (64 MiB) |
-| `max_value_length`       | Maximum length of an extracted attribute value.                                                                                     | `256`             | `1` to `1024` (CloudWatch limit)        |
+| `max_state_bytes`        | Maximum size of the serialized state, in bytes. The connector uses a size estimate. Refer to [Entity state](#entity-state).          | `1048576` (1 MiB) | `65536` (64 KiB) to `67108864` (64 MiB) |
+| `max_value_length`       | Maximum length in bytes of each value: the facts, the included resource attributes, and the identity.                               | `256`             | `1` to `1024` (CloudWatch limit)        |
 | `error_mode`             | Action on OTTL evaluation errors at runtime: `propagate`, `ignore`, or `silent`. OTTL parse errors always stop the startup.         | `ignore`          | One of the three values.                |
 | `identity_output_prefix` | If set, the connector also emits each identity value as the resource attribute `<prefix><identity key>`.                           | `""`              |                                         |
 | `rules`                  | The rules. Refer to the next table.                                                                                                 | none              | Minimum one rule.                       |
@@ -46,7 +46,7 @@ The connector does not change the logs that it consumes. Thus, it can share a lo
 | `body_contains`               | Substrings to find in the body. This is a plain substring check on a string body, with no OTTL and no regex. It runs before the conditions.                                       | `[]`      | Entries must not be empty.                             |
 | `conditions`                  | OTTL conditions on the log context, joined with OR.                                                                                                                               | `[]`      | Each condition must parse.                             |
 | `identity`                    | Resource attribute keys that identify an entity, for example `k8s.pod.uid`. The connector keeps the latest facts for each entity.                                                | none      | Minimum one key. No empty or duplicate keys.           |
-| `include_resource_attributes` | Resource attribute keys that the connector copies to the emitted metric. If `identity_output_prefix` is empty, this list must contain all identity keys. Otherwise, two entities can produce the same series. | `[]`      | No empty or duplicate keys.                            |
+| `include_resource_attributes` | Resource attribute keys that the connector copies to the emitted metric. If `identity_output_prefix` is empty, this list must contain all identity keys. Without them, two entities can produce the same series. | `[]`      | No empty or duplicate keys.                            |
 | `attributes`                  | The facts to extract. Refer to the next table.                                                                                                                                    | none      | Minimum one. Maximum `max_attributes`.                 |
 | `emit_interval`               | Overrides the connector `emit_interval` for this rule. `0` uses the connector value.                                                                                             | `0`       | If set: `1s` to `24h`.                                 |
 | `max_entities`                | Maximum number of entities that this rule tracks. `0` uses the default.                                                                                                          | `0` (500) | If set: `1` to `100000`.                               |
@@ -86,6 +86,9 @@ An index into a converter result with a missing key gives an evaluation error, n
 
 ## Example
 
+The example keeps the state in `file_storage/state` and emits every 30 seconds. Its rule is the rule in
+`testdata/vllm_rule.yaml`, with all 14 facts of the vLLM engine startup line.
+
 ```yaml
 extensions:
   file_storage/state:
@@ -98,7 +101,8 @@ connectors:
     identity_output_prefix: cwagent.info.identity.
     rules:
       - name: vllm_engine_config_info
-        description: vLLM engine configuration from the engine startup log line.
+        description: vLLM engine configuration parsed from the engine startup log line. The value is always 1.
+        max_entities: 500
         # vllm_version needs the full startup phrase and ") with config: ", so a line with only the phrase gives no series.
         # A prefix check does not work, because vLLM writes "(EngineCore pid=N) INFO ..." or "INFO ..." first.
         body_contains:
@@ -110,12 +114,48 @@ connectors:
         attributes:
           - key: vllm_version
             value: 'ExtractPatterns(log.body, "Initializing an? (?:V[01] )?LLM engine \\(v(?P<v>[^)]+)\\) with config: ")["v"]'
+          # A block scalar, because the pattern contains single quotes.
+          - key: model
+            value: |-
+              ExtractPatterns(log.body, "with config: model='(?P<v>[^']*)'")["v"]
           # A missing key in ExtractPatterns is an evaluation error, so the default applies to "Initializing an LLM engine" (v0.6.x) lines.
           - key: vllm_engine
             value: 'ExtractPatterns(log.body, "Initializing a (?P<v>V[01]) LLM engine")["v"]'
             default_value: V0
+          - key: served_model_name
+            value: 'ExtractPatterns(log.body, ", served_model_name=(?P<v>[^,]+),")["v"]'
+            optional: true
+          - key: dtype
+            value: 'ExtractPatterns(log.body, ", dtype=(?:torch\\.)?(?P<v>[A-Za-z0-9_]+),")["v"]'
+            optional: true
+          - key: max_seq_len
+            value: 'ExtractPatterns(log.body, ", max_seq_len=(?P<v>\\d+),")["v"]'
+            optional: true
           - key: tensor_parallel_size
             value: 'ExtractPatterns(log.body, ", tensor_parallel_size=(?P<v>\\d+),")["v"]'
+            optional: true
+          - key: pipeline_parallel_size
+            value: 'ExtractPatterns(log.body, ", pipeline_parallel_size=(?P<v>\\d+),")["v"]'
+            optional: true
+          - key: data_parallel_size
+            value: 'ExtractPatterns(log.body, ", data_parallel_size=(?P<v>\\d+),")["v"]'
+            optional: true
+          - key: quantization
+            value: 'ExtractPatterns(log.body, ", quantization=(?P<v>[A-Za-z0-9_.\\-]+),")["v"]'
+            optional: true
+          - key: enforce_eager
+            value: 'ExtractPatterns(log.body, ", enforce_eager=(?P<v>True|False),")["v"]'
+            optional: true
+          - key: kv_cache_dtype
+            value: 'ExtractPatterns(log.body, ", kv_cache_dtype=(?P<v>[A-Za-z0-9_]+),")["v"]'
+            optional: true
+          - key: enable_prefix_caching
+            value: 'ExtractPatterns(log.body, ", enable_prefix_caching=(?P<v>True|False|None),")["v"]'
+            optional: true
+          # "None" for speculative_config=None, the method for speculative_config=SpeculativeConfig(method='mtp', ...).
+          - key: speculative_method
+            value: |-
+              ExtractPatterns(log.body, "speculative_config=(?:SpeculativeConfig\\(method=')?(?P<v>None|[^',)]+)")["v"]
             optional: true
 
 service:
@@ -134,10 +174,10 @@ service:
 ### Matching and facts
 
 For each record and rule, the connector first does the `body_contains` check. A record without a string body
-does not match a rule that sets `body_contains`. Most records fail this check, so it does not allocate memory.
-Then the connector evaluates the `conditions`. Then it reads the identity from the resource attributes, one time
-for each resource and rule. If an identity key is missing or its value is empty, the rule does not use records of
-that resource. Then the connector gets the facts in the configured order.
+does not match a rule that sets `body_contains`. Most records fail this check, and the check does not allocate
+memory. Then the connector evaluates the `conditions`. Then it reads the identity from the resource attributes,
+one time for each resource and rule. If an identity key is missing or its value is empty, the rule does not use
+records of that resource. Then the connector gets the facts in the configured order.
 
 Values that are not strings are converted as by `pcommon.Value.AsString`. For example, the integer 4 becomes `"4"`.
 Each value, also each resource attribute and identity value, is cut to `max_value_length` bytes. The cut is at a
@@ -145,8 +185,9 @@ UTF-8 character boundary. A value that is empty after the cut counts as missing.
 
 With `error_mode: propagate`, the connector stops the batch at an evaluation error. This applies to the
 conditions, and to a required attribute without `default_value`. The connector returns the error. It still
-applies the records before that record. With `ignore` or `silent`, the connector does not use the record. The
-connector does not change the logs that it consumes.
+applies the records before that record. With `ignore` or `silent`, a condition with an evaluation error counts as
+false, and the other conditions still run. An attribute with an evaluation error has no value, and then
+`default_value` and `optional` apply. The connector does not change the logs that it consumes.
 
 ### Entity state
 
@@ -166,12 +207,12 @@ entities. If an entity with this identity exists, its activity moves to the late
 The activity never moves back. A resource without a known entity creates no entity. Thus, a pod that keeps
 logging stays in the state, and a pod that stopped logging is the first to go.
 
-A rule tracks at most `max_entities` entities. A new entity causes the eviction of the entity of that rule that
-has the oldest activity. `max_state_bytes` limits an estimate of the size of the serialized state, for all rules
-together. The estimate counts each key and value with its JSON escapes. If the state is too large, the connector
-evicts the entities with the oldest activity, from any rule.
-The connector does not keep an entity that alone is larger than `max_state_bytes`. In one batch, the connector
-updates the activity before it adds new entities. Thus, the eviction for a new entity uses the latest activity.
+A rule tracks at most `max_entities` entities. If the rule is at this limit, a new entity causes the eviction of
+the entity of that rule that has the oldest activity. `max_state_bytes` limits an estimate of the size of the
+serialized state, for all rules together. The estimate counts each key and value with its JSON escapes. If the
+state is too large, the connector evicts the entities with the oldest activity, from any rule. The connector does
+not keep an entity that alone is larger than `max_state_bytes`. In one batch, the connector updates the activity
+before it adds new entities. Thus, the eviction for a new entity uses the latest activity.
 
 ### Emission
 
@@ -183,16 +224,17 @@ series. The record time is never the data point time, because CloudWatch rejects
 
 The connector emits in two ways:
 
-- On change. If `emit_on_change` is `true`, a batch that adds an entity or changes its facts causes an immediate
-  emission of these entities. Each entity is in the emission one time, with its final facts.
-- On ticks. At each emit interval, the connector emits all the entities of the rules with that interval. The
-  ticks also run if `emit_on_change` is `false`.
+- On change. If `emit_on_change` is `true`, a batch that adds an entity, or changes its facts or its included
+  resource attributes, causes an immediate emission of these entities. Each entity is in the emission one time,
+  with its final facts.
+- On ticks. At each emit interval, the connector emits all the entities of the rules with that interval. If
+  `emit_on_change` is `false`, the ticks also run.
 
 The effective interval of a rule is its `emit_interval`, else the connector `emit_interval`. Rules with the same
 effective interval share one timer. Each tick sends all their entities in one call to the next consumer. If these
 rules have no entity, the tick sends nothing.
 
-The connector does not emit when it starts. The first tick of each interval comes 10 seconds after the start, plus
+At startup, the connector does not emit. The first tick of each interval comes 10 seconds after the start, plus
 a random delay. The random delay is less than the interval and less than 10 seconds. The 10 seconds give the
 k8sattributes processor in the metrics pipeline time to fill its pod cache. Without them, a filter on its
 attributes drops all the series of the first emission. The random delay spreads the ticks of agents that start
@@ -200,26 +242,28 @@ at the same time. After the first tick, a tick comes at each interval.
 
 If the next consumer returns an error, the connector logs it, at most one time each minute. The error does not
 go back to the logs pipeline, and the next ticks still run. At shutdown, the connector stops the ticks. It waits
-for a tick in progress until the shutdown deadline. If the shutdown cancels a tick in progress, the error of the
-next consumer is a Debug log, and it does not count in `emit_errors`. With `storage`, the connector writes the
-state before it waits for the tick.
+for a tick in progress until the shutdown deadline. If the shutdown cancels a tick in progress, the connector logs
+the error of the next consumer at the Debug level. This error does not count in `emit_errors`. With `storage`, the
+connector writes the state before it waits for the tick.
 
 ### Persistence
 
 If `storage` is set, the connector keeps its state in the storage extension. The state is one JSON record with the
-key `state` and the version `1`. For each rule and entity, the record holds the identity, the included resource
-attributes, the facts, the start time of the series, the time of the latest facts, and the activity.
+key `state` and the version `1`. The record holds these values for each rule and entity: the identity, the
+included resource attributes, and the facts. It also holds the start time of the series, the time of the latest
+facts, and the activity.
 
-The connector reads the record one time, when it starts. After that, it only writes the record. The emission
-always uses the state in memory. The connector writes the record at these times:
+At startup, the connector reads the record one time. After that, it only writes the record. The emission always
+uses the state in memory. The connector writes the record at these times:
 
-- About 1 second after a change. A change is a new entity, new facts, or an eviction. All the changes in that
-  second go into one write.
-- At most one time in 5 minutes, if only the activity of entities moved.
-- At shutdown, if a change or an activity is not written yet. A tick in progress does not delay this write.
+- Within about 1 second after a change. A change is a new entity, new facts, or an eviction. All the changes in
+  that second go into one write.
+- At most one time in 5 minutes, for entities whose activity or time of the latest facts moved, with no change.
+- At shutdown, for a change or an activity that the connector did not write yet. A tick in progress does not
+  delay this write.
 
-The connector does not emit when it starts. The first tick sends the restored entities. Their series keep their
-labels and their start times, also if the pods do not log the startup line again.
+At startup, the connector does not emit. The first tick sends the restored entities. The pods do not have to log
+the startup line again. Their series keep their labels and their start times.
 
 If the record is corrupt or has another version, the connector logs a warning and starts with an empty state. If
 there is no usable record, the connector writes the current state about 1 second after the start. Thus, the
@@ -231,19 +275,20 @@ open its storage, the connector does not start.
 The connector fits the restored state to the current configuration:
 
 - The connector removes the entities of a rule that is not configured. A renamed rule is a new rule.
+- If the `identity` keys of a rule changed, the connector removes the entities of that rule.
 - The facts keep only the configured attributes, in the configured order. The connector cuts each value to
   `max_value_length`.
 - If an attribute without `default_value` and without `optional` has no value, the connector removes the entity.
-  A new attribute stays absent until the next matching record of the entity, also with `default_value`, because
-  the default value can be wrong for the entity.
+  A new attribute stays absent until the next matching record of the entity. This also applies with
+  `default_value`, because the default value can be wrong for the entity.
 - The resource keeps only the `include_resource_attributes`, in that order. The connector cuts each value to
   `max_value_length`.
 - If an identity value is longer than `max_value_length`, the connector removes the entity. No record can give
   its identity again.
 - `max_entities` and `max_state_bytes` apply. The connector keeps the entities with the latest activity.
 
-The connector writes one Info log with the number of entities that it kept and removed. If it changed or removed
-an entity, it writes the cleaned state about 1 second after the start.
+After it reads a record, the connector writes one Info log with the number of entities that it kept, removed, and
+changed. If it changed or removed an entity, it writes the cleaned state about 1 second after the start.
 
 `max_state_bytes` also bounds the record. The size estimate of the state is never less than the size of its
 entities in the record. The limit of the record is `max_state_bytes` plus a fixed margin for the record frame and
@@ -258,7 +303,7 @@ name.
 | Metric                                                        | Type    | Attributes        | Description                                                                                        |
 |---------------------------------------------------------------|---------|-------------------|----------------------------------------------------------------------------------------------------|
 | `otelcol_connector_signal_to_info_metric_records_matched`     | Counter | `rule`            | Records that pass the `body_contains` check and the conditions of the rule.                        |
-| `otelcol_connector_signal_to_info_metric_records_not_used`    | Counter | `rule`, `reason`  | Records that pass the `body_contains` check but give no observation. Refer to the next list.       |
+| `otelcol_connector_signal_to_info_metric_records_not_used`    | Counter | `rule`, `reason`  | Records that pass the `body_contains` check but that the rule does not use. Refer to the next list. |
 | `otelcol_connector_signal_to_info_metric_values_truncated`    | Counter | `rule`            | Values cut to `max_value_length`. An identity or resource value counts one time for each resource. |
 | `otelcol_connector_signal_to_info_metric_entities_evicted`    | Counter | `rule`, `reason`  | Entities that the state removed or did not store. `rule` is the rule of the entity.                |
 | `otelcol_connector_signal_to_info_metric_datapoints_emitted`  | Counter | `rule`, `trigger` | Data points that the next consumer accepted. `trigger` is `change` or `interval`.                  |
@@ -270,8 +315,8 @@ name.
 | `otelcol_connector_signal_to_info_metric_state_save_rejected` | Counter | none              | State records that the connector did not write, because they are larger than the record limit.     |
 | `otelcol_connector_signal_to_info_metric_state_saved_bytes`   | Gauge   | none              | Size of the state record that the connector last read or wrote, in bytes.                          |
 
-The `state_saves`, `state_save_errors`, `state_save_rejected`, and `state_saved_bytes` metrics exist only if
-`storage` is set.
+If `storage` is not set, the `state_saves`, `state_save_errors`, `state_save_rejected`, and `state_saved_bytes`
+metrics do not exist.
 
 The `reason` values of `records_not_used`:
 
@@ -287,7 +332,8 @@ The `reason` values of `entities_evicted`:
 - `max_state_bytes`: the state was larger than `max_state_bytes`.
 - `too_large`: the entity alone is larger than `max_state_bytes`. The connector removed it, or did not store it.
 
-Records that fail the `body_contains` check change no metric.
+Records that fail the `body_contains` check or the conditions change no metric. The only exception is the
+`evaluation_error` reason of `records_not_used`.
 
 ### Logs
 
@@ -302,10 +348,11 @@ evicted entity.
   `error_mode: silent` turns this log off.
 - Warn: the next consumer returned an error.
 
-If `storage` is set, the connector also logs a failed write of the state at the Error level, and a record that is
-too large at the Warn level. Each of the two logs comes at most one time each minute.
+If `storage` is set, the connector also logs a failed write of the state at the Error level. It logs a record
+that is too large at the Warn level. Each of the two logs comes at most one time each minute.
 
-The other logs about single records and batches are at the Debug level.
+The other logs of the connector about single records and batches are at the Debug level. With
+`error_mode: ignore`, OTTL logs each evaluation error of a condition at the Warn level, with no rate limit.
 
 [OTTL]: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/pkg/ottl/README.md
 [OTTL functions]: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/pkg/ottl/ottlfuncs/README.md#converters

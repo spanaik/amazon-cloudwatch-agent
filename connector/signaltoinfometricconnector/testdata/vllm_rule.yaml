@@ -1,11 +1,12 @@
 # The vLLM engine configuration rule with the expressions that the Helm chart renders, with all 14 facts.
-# The connector settings are at the top level (no component ID).
+# The connector settings are at the top level (no component ID). The example in README.md has the same rule.
 identity_output_prefix: cwagent.info.identity.
 rules:
   - name: vllm_engine_config_info
     description: vLLM engine configuration parsed from the engine startup log line. The value is always 1.
     max_entities: 500
     # vllm_version needs the full startup phrase and ") with config: ", so a line with only the phrase gives no series.
+    # A prefix check does not work, because vLLM writes "(EngineCore pid=N) INFO ..." or "INFO ..." first.
     body_contains:
       - "Initializing an LLM engine (v"
       - "Initializing a V0 LLM engine (v"
@@ -19,7 +20,7 @@ rules:
       - key: model
         value: |-
           ExtractPatterns(log.body, "with config: model='(?P<v>[^']*)'")["v"]
-      # "Initializing an LLM engine" (v0.6.x) has no engine version, so the default applies.
+      # A missing key in ExtractPatterns is an evaluation error, so the default applies to "Initializing an LLM engine" (v0.6.x) lines.
       - key: vllm_engine
         value: 'ExtractPatterns(log.body, "Initializing a (?P<v>V[01]) LLM engine")["v"]'
         default_value: V0

@@ -217,7 +217,7 @@ func (s *Store[T]) Start(snapshot func() (T, error)) {
 	s.snapshot = snapshot
 	s.saveMu.Unlock()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // G118: Shutdown calls s.cancel.
 	s.cancel = cancel
 	s.done = make(chan struct{})
 	go s.run(ctx, s.done)

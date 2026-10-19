@@ -125,7 +125,7 @@ func newTelemetry(mp otelmetric.MeterProvider, ruleNames []string, s *state) (*t
 	t.recordsMatched = newCounter(metricRecordsMatched,
 		"Number of log records that passed the body_contains check and the conditions of a rule.", "{records}")
 	t.recordsNotUsed = newCounter(metricRecordsNotUsed,
-		"Number of log records that passed the body_contains check of a rule but gave no observation.", "{records}")
+		"Number of log records that passed the body_contains check of a rule but that the rule did not use. Records that fail the conditions are not counted.", "{records}")
 	t.valuesTruncated = newCounter(metricValuesTruncated,
 		"Number of values cut to max_value_length.", "{values}")
 	t.entitiesEvicted = newCounter(metricEntitiesEvicted,

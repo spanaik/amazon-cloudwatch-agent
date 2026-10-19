@@ -275,7 +275,7 @@ func TestJSONStringLen(t *testing.T) {
 		inputs = append(inputs, string([]byte{byte(b)}))
 	}
 	alphabet := []string{"a", "Z", "0", " ", `"`, `\`, "<", ">", "&", "\x00", "\n", "\x7f", "é", "日", "🙂", "\u2028", "\u2029", "\xff", "\xe6\x97", "\xc3"}
-	rnd := rand.New(rand.NewPCG(1, 2))
+	rnd := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // G404: a fixed seed keeps the test reproducible.
 	for range 2000 {
 		var sb strings.Builder
 		for range rnd.IntN(12) {

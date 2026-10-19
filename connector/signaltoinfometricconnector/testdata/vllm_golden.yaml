@@ -2,10 +2,10 @@
 # testdata/vllm_rule.yaml, one per pod, sorted by pod name. The test reads every value
 # verbatim as a string (True, 1, and None stay strings) and compares the pairs in order.
 #
-# The attributes of vllm-main-7d9f, vllm-v0285-5c4b, vllm-v0290-6a1e, and vllm-v085-9e2a
-# are the PoC debug exporter output (vllm-info-cwagent-spike/result-new-pods.txt). The PoC
-# output has no vllm-v063-1b7c; its attributes are derived by hand from its fixture line,
-# with vllm_engine V0 from default_value. Fixtures without data_parallel_size omit it.
+# The attributes are the values in the startup line of each fixture. vllm-v063-1b7c logs
+# "Initializing an LLM engine" (the v0.6.x form) with no engine version, so its vllm_engine
+# V0 comes from default_value. The startup lines of vllm-v063-1b7c and vllm-v085-9e2a have
+# no data_parallel_size, so their series omit it.
 #
 # The resource holds include_resource_attributes, then the identity with
 # identity_output_prefix; the test sets k8s.pod.uid to "uid-<pod>". start_timestamp is the
