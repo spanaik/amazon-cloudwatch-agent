@@ -48,5 +48,9 @@ func createLogsToMetrics(
 	if !ok {
 		return nil, fmt.Errorf("invalid configuration type: %T", cfg)
 	}
-	return newConnector(set, c, nextConsumer), nil
+	conn, err := newConnector(set, c, nextConsumer)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }

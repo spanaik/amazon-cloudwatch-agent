@@ -131,7 +131,52 @@ service:
 
 ## Behavior
 
-TODO: After the runtime is available, describe the matching, the entity state, the emission, and the persistence.
+### Matching and facts
+
+For each record and rule, the connector first does the `body_contains` check. A record without a string body
+does not match a rule that sets `body_contains`. Most records fail this check, so it does not allocate memory.
+Then the connector evaluates the `conditions`. Then it reads the identity from the resource attributes, one time
+for each resource and rule. If an identity key is missing or its value is empty, the rule does not use records of
+that resource. Then the connector gets the facts in the configured order.
+
+Values that are not strings are converted as by `pcommon.Value.AsString`. For example, the integer 4 becomes `"4"`.
+Each value, also each resource attribute and identity value, is cut to `max_value_length` bytes. The cut is at a
+UTF-8 character boundary. A value that is empty after the cut counts as missing.
+
+With `error_mode: propagate`, the connector stops the batch at an evaluation error. This applies to the
+conditions, and to a required attribute without `default_value`. The connector returns the error. It still
+applies the records before that record. With `ignore` or `silent`, the connector does not use the record. The
+connector does not change the logs that it consumes.
+
+### Entity state
+
+The connector keeps the latest facts for each rule and identity. The record time is the record timestamp, else
+the observed timestamp, else the current time. For a known entity:
+
+- If the record is older than the stored facts, the connector does not use it. After a container restart,
+  kubelet keeps both log files, and the receiver can read them in any order.
+- If the facts and the included resource attributes are the same, the entity stays the same series.
+- If they are different, the connector replaces them and starts a new series. The start time of the series is
+  the record time.
+
+A rule tracks at most `max_entities` entities. A new entity causes the eviction of the entity of that rule that
+has the oldest activity. `max_state_bytes` limits an estimate of the size of the serialized state, for all rules
+together. If the state is too large, the connector evicts the entities with the oldest activity, from any rule.
+The connector does not keep an entity that alone is larger than `max_state_bytes`.
+
+### Emission
+
+Each entity is one series: a gauge with the value `1` and the rule name as metric name. The resource has the
+included resource attributes. If `identity_output_prefix` is set, the resource also has the identity. The data
+point attributes are the facts. The data point time is the emission time. The start time is the start of the
+series. The record time is never the data point time, because CloudWatch rejects data points that are older than
+14 days.
+
+If `emit_on_change` is `true`, a new entity or a change of facts causes an immediate emission. If the next
+consumer returns an error, the connector logs it, at most one time each minute. The error does not go back to
+the logs pipeline.
+
+TODO: Describe the periodic emission and the persistence.
 
 [OTTL]: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/pkg/ottl/README.md
 [OTTL functions]: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/pkg/ottl/ottlfuncs/README.md#converters
