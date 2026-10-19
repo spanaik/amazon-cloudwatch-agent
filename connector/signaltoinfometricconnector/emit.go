@@ -90,13 +90,21 @@ func (c *infoMetricConnector) startEmitting() {
 	c.stopEmit, c.emitDone = cancel, done
 }
 
-// stopEmitting stops the emit groups and waits for them, bounded by ctx. It
-// is safe to call before startEmitting and more than once.
-func (c *infoMetricConnector) stopEmitting(ctx context.Context) error {
-	if c.stopEmit == nil {
+// cancelEmitting cancels the context of the emit groups and returns at
+// once. It is safe to call before startEmitting and more than once.
+func (c *infoMetricConnector) cancelEmitting() {
+	if c.stopEmit != nil {
+		c.stopEmit()
+	}
+}
+
+// waitEmitting waits for the emit groups to stop after cancelEmitting,
+// bounded by ctx. It is safe to call before startEmitting and more than
+// once.
+func (c *infoMetricConnector) waitEmitting(ctx context.Context) error {
+	if c.emitDone == nil {
 		return nil
 	}
-	c.stopEmit()
 	select {
 	case <-c.emitDone:
 		return nil
@@ -189,11 +197,21 @@ func (c *infoMetricConnector) buildMetrics(now time.Time, entries []emitEntry) p
 // error is logged at most once per logInterval and not returned: the logs
 // pipeline that the connector shares with other exporters must not fail
 // because of the metrics side, and a tick has no caller to return it to.
+//
+// An error after ctx ended is logged at Debug and not counted: Shutdown
+// cancels the context of a tick that is in progress, and the next consumer
+// then returns the cancellation, which is not a downstream failure.
 func (c *infoMetricConnector) emit(ctx context.Context, entries []emitEntry, trigger emitTrigger) {
 	if len(entries) == 0 {
 		return
 	}
 	err := c.next.ConsumeMetrics(ctx, c.buildMetrics(c.now(), entries))
+	if err != nil && ctx.Err() != nil {
+		if ce := c.logger.Check(zap.DebugLevel, "Info metrics not sent: the emission was canceled"); ce != nil {
+			ce.Write(zap.Error(err), zap.String("trigger", triggerNames[trigger]))
+		}
+		return
+	}
 	c.tel.recordEmit(ctx, entries, trigger, err)
 	if err != nil {
 		c.logDownstreamError(err)

@@ -8,12 +8,15 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 )
 
 // Size estimate of the serialized state, used for max_state_bytes. The
-// estimate of one entity is the sum of the lengths of its state key and of
-// every key and value it holds, plus these constants. They approximate the
-// JSON encoding of an entity in a snapshot.
+// estimate of one entity is the sum of the JSON-encoded lengths of its state
+// key and of every key and value it holds, plus these constants. They cover
+// the rest of the JSON encoding of an entity in a snapshot, with the comma
+// that separates it from the next, so the estimate is at least the encoded
+// size.
 const (
 	// entityOverheadBytes covers the field names, brackets, and separators
 	// of one entity, and its three timestamps at 19 digits each:
@@ -497,13 +500,45 @@ func (s *state) removeLocked(ref entityRef) {
 // entitySize estimates the serialized size of an entity; see
 // entityOverheadBytes.
 func entitySize(key string, e *entity) int {
-	return entityOverheadBytes + len(key) + pairsSize(e.Identity) + pairsSize(e.Resource) + pairsSize(e.Facts)
+	return entityOverheadBytes + jsonStringLen(key) + pairsSize(e.Identity) + pairsSize(e.Resource) + pairsSize(e.Facts)
 }
 
 func pairsSize(pairs []kv) int {
 	n := 0
 	for _, p := range pairs {
-		n += pairOverheadBytes + len(p.Key) + len(p.Value)
+		n += pairOverheadBytes + jsonStringLen(p.Key) + jsonStringLen(p.Value)
+	}
+	return n
+}
+
+// jsonStringLen returns the length of s as encoding/json writes it in a
+// string, without the quotes. It is len(s) unless s holds a character that
+// encoding/json escapes: '"', '\', and \b, \f, \n, \r, \t take 2 bytes;
+// other control characters and '<', '>', '&' take 6 (\u00XX); an invalid
+// UTF-8 byte takes 6 (\ufffd); U+2028 and U+2029 take 6.
+func jsonStringLen(s string) int {
+	n := 0
+	for i := 0; i < len(s); {
+		b := s[i]
+		if b < utf8.RuneSelf {
+			switch {
+			case b == '"' || b == '\\' || b == '\b' || b == '\f' || b == '\n' || b == '\r' || b == '\t':
+				n += 2
+			case b < 0x20 || b == '<' || b == '>' || b == '&':
+				n += 6
+			default:
+				n++
+			}
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if (r == utf8.RuneError && size == 1) || r == '\u2028' || r == '\u2029' {
+			n += 6
+		} else {
+			n += size
+		}
+		i += size
 	}
 	return n
 }

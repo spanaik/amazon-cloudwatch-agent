@@ -168,7 +168,8 @@ logging stays in the state, and a pod that stopped logging is the first to go.
 
 A rule tracks at most `max_entities` entities. A new entity causes the eviction of the entity of that rule that
 has the oldest activity. `max_state_bytes` limits an estimate of the size of the serialized state, for all rules
-together. If the state is too large, the connector evicts the entities with the oldest activity, from any rule.
+together. The estimate counts each key and value with its JSON escapes. If the state is too large, the connector
+evicts the entities with the oldest activity, from any rule.
 The connector does not keep an entity that alone is larger than `max_state_bytes`. In one batch, the connector
 updates the activity before it adds new entities. Thus, the eviction for a new entity uses the latest activity.
 
@@ -199,9 +200,54 @@ at the same time. After the first tick, a tick comes at each interval.
 
 If the next consumer returns an error, the connector logs it, at most one time each minute. The error does not
 go back to the logs pipeline, and the next ticks still run. At shutdown, the connector stops the ticks. It waits
-for a tick in progress until the shutdown deadline.
+for a tick in progress until the shutdown deadline. If the shutdown cancels a tick in progress, the error of the
+next consumer is a Debug log, and it does not count in `emit_errors`. With `storage`, the connector writes the
+state before it waits for the tick.
 
-TODO: Describe the persistence.
+### Persistence
+
+If `storage` is set, the connector keeps its state in the storage extension. The state is one JSON record with the
+key `state` and the version `1`. For each rule and entity, the record holds the identity, the included resource
+attributes, the facts, the start time of the series, the time of the latest facts, and the activity.
+
+The connector reads the record one time, when it starts. After that, it only writes the record. The emission
+always uses the state in memory. The connector writes the record at these times:
+
+- About 1 second after a change. A change is a new entity, new facts, or an eviction. All the changes in that
+  second go into one write.
+- At most one time in 5 minutes, if only the activity of entities moved.
+- At shutdown, if a change or an activity is not written yet. A tick in progress does not delay this write.
+
+The connector does not emit when it starts. The first tick sends the restored entities. Their series keep their
+labels and their start times, also if the pods do not log the startup line again.
+
+If the record is corrupt or has another version, the connector logs a warning and starts with an empty state. If
+there is no usable record, the connector writes the current state about 1 second after the start. Thus, the
+connector logs the warning only one time. If the read from the storage extension fails, the connector also logs a
+warning and starts with an empty state. It does not replace the record until a change, because the record can
+be valid. If the storage extension does not exist, is not a storage extension, or cannot
+open its storage, the connector does not start.
+
+The connector fits the restored state to the current configuration:
+
+- The connector removes the entities of a rule that is not configured. A renamed rule is a new rule.
+- The facts keep only the configured attributes, in the configured order. The connector cuts each value to
+  `max_value_length`.
+- If an attribute without `default_value` and without `optional` has no value, the connector removes the entity.
+  A new attribute stays absent until the next matching record of the entity, also with `default_value`, because
+  the default value can be wrong for the entity.
+- The resource keeps only the `include_resource_attributes`, in that order. The connector cuts each value to
+  `max_value_length`.
+- If an identity value is longer than `max_value_length`, the connector removes the entity. No record can give
+  its identity again.
+- `max_entities` and `max_state_bytes` apply. The connector keeps the entities with the latest activity.
+
+The connector writes one Info log with the number of entities that it kept and removed. If it changed or removed
+an entity, it writes the cleaned state about 1 second after the start.
+
+`max_state_bytes` also bounds the record. The size estimate of the state is never less than the size of its
+entities in the record. The limit of the record is `max_state_bytes` plus a fixed margin for the record frame and
+the rule names. Thus, the connector can always write a state that fits in `max_state_bytes`.
 
 ### Telemetry
 
@@ -209,16 +255,23 @@ The connector reports these metrics in the collector telemetry. The meter name i
 `github.com/aws/amazon-cloudwatch-agent/connector/signaltoinfometricconnector`. The `rule` attribute is the rule
 name.
 
-| Metric                                                       | Type    | Attributes        | Description                                                                                        |
-|--------------------------------------------------------------|---------|-------------------|----------------------------------------------------------------------------------------------------|
-| `otelcol_connector_signal_to_info_metric_records_matched`    | Counter | `rule`            | Records that pass the `body_contains` check and the conditions of the rule.                        |
-| `otelcol_connector_signal_to_info_metric_records_not_used`   | Counter | `rule`, `reason`  | Records that pass the `body_contains` check but give no observation. Refer to the next list.       |
-| `otelcol_connector_signal_to_info_metric_values_truncated`   | Counter | `rule`            | Values cut to `max_value_length`. An identity or resource value counts one time for each resource. |
-| `otelcol_connector_signal_to_info_metric_entities_evicted`   | Counter | `rule`, `reason`  | Entities that the state removed or did not store. `rule` is the rule of the entity.                |
-| `otelcol_connector_signal_to_info_metric_datapoints_emitted` | Counter | `rule`, `trigger` | Data points that the next consumer accepted. `trigger` is `change` or `interval`.                  |
-| `otelcol_connector_signal_to_info_metric_emit_errors`        | Counter | `rule`            | Failed calls to the next consumer. A call counts one time for each rule in it.                     |
-| `otelcol_connector_signal_to_info_metric_entities`           | Gauge   | `rule`            | Entities in the state.                                                                             |
-| `otelcol_connector_signal_to_info_metric_state_bytes`        | Gauge   | none              | Size estimate of the serialized state, in bytes.                                                   |
+| Metric                                                        | Type    | Attributes        | Description                                                                                        |
+|---------------------------------------------------------------|---------|-------------------|----------------------------------------------------------------------------------------------------|
+| `otelcol_connector_signal_to_info_metric_records_matched`     | Counter | `rule`            | Records that pass the `body_contains` check and the conditions of the rule.                        |
+| `otelcol_connector_signal_to_info_metric_records_not_used`    | Counter | `rule`, `reason`  | Records that pass the `body_contains` check but give no observation. Refer to the next list.       |
+| `otelcol_connector_signal_to_info_metric_values_truncated`    | Counter | `rule`            | Values cut to `max_value_length`. An identity or resource value counts one time for each resource. |
+| `otelcol_connector_signal_to_info_metric_entities_evicted`    | Counter | `rule`, `reason`  | Entities that the state removed or did not store. `rule` is the rule of the entity.                |
+| `otelcol_connector_signal_to_info_metric_datapoints_emitted`  | Counter | `rule`, `trigger` | Data points that the next consumer accepted. `trigger` is `change` or `interval`.                  |
+| `otelcol_connector_signal_to_info_metric_emit_errors`         | Counter | `rule`            | Failed calls to the next consumer. A call counts one time for each rule in it.                     |
+| `otelcol_connector_signal_to_info_metric_entities`            | Gauge   | `rule`            | Entities in the state.                                                                             |
+| `otelcol_connector_signal_to_info_metric_state_bytes`         | Gauge   | none              | Size estimate of the serialized state, in bytes.                                                   |
+| `otelcol_connector_signal_to_info_metric_state_saves`         | Counter | none              | Writes of the state record to the storage extension.                                               |
+| `otelcol_connector_signal_to_info_metric_state_save_errors`   | Counter | none              | Failed writes of the state record. The snapshot, the encoding, or the storage write failed.        |
+| `otelcol_connector_signal_to_info_metric_state_save_rejected` | Counter | none              | State records that the connector did not write, because they are larger than the record limit.     |
+| `otelcol_connector_signal_to_info_metric_state_saved_bytes`   | Gauge   | none              | Size of the state record that the connector last read or wrote, in bytes.                          |
+
+The `state_saves`, `state_save_errors`, `state_save_rejected`, and `state_saved_bytes` metrics exist only if
+`storage` is set.
 
 The `reason` values of `records_not_used`:
 
@@ -248,6 +301,9 @@ evicted entity.
   the log format often causes this. If the collector telemetry level is `none`, this log is the only visible sign.
   `error_mode: silent` turns this log off.
 - Warn: the next consumer returned an error.
+
+If `storage` is set, the connector also logs a failed write of the state at the Error level, and a record that is
+too large at the Warn level. Each of the two logs comes at most one time each minute.
 
 The other logs about single records and batches are at the Debug level.
 

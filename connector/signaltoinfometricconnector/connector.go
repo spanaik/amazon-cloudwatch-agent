@@ -5,6 +5,7 @@ package signaltoinfometricconnector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -16,12 +17,16 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.uber.org/zap"
+
+	"github.com/aws/amazon-cloudwatch-agent/internal/statestore"
 )
 
 // infoMetricConnector matches log records against the rules, keeps the
 // latest facts per rule and entity, and emits an Info metric when the facts
 // of an entity change and at each emit interval.
 type infoMetricConnector struct {
+	// id is the component ID, which names the storage client.
+	id     component.ID
 	logger *zap.Logger
 	cfg    *Config
 	next   consumer.Metrics
@@ -45,6 +50,9 @@ type infoMetricConnector struct {
 
 	// hooks are called after ConsumeLogs changed the state.
 	hooks stateHooks
+	// store persists the state. It is set by Start when storage is
+	// configured, and nil otherwise.
+	store *statestore.Store[stateSnapshot]
 
 	downstreamErrLog logLimiter
 	// evictionLog is indexed by evictReason. Only max_entities and
@@ -88,6 +96,7 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		return nil, fmt.Errorf("failed to create the connector telemetry: %w", err)
 	}
 	return &infoMetricConnector{
+		id:                 set.ID,
 		logger:             set.Logger,
 		cfg:                cfg,
 		next:               next,
@@ -103,19 +112,41 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 	}, nil
 }
 
-// Start launches the periodic emission and returns. It does not emit: the
-// first tick of each emit group comes after a startup delay.
-func (c *infoMetricConnector) Start(context.Context, component.Host) error {
+// Start restores the stored state when storage is configured, then
+// launches the periodic emission and returns. It does not emit: the first
+// tick of each emit group comes after a startup delay, also for restored
+// entities. It returns an error only when the storage extension is missing,
+// is not a storage extension, or cannot give a storage client.
+func (c *infoMetricConnector) Start(ctx context.Context, host component.Host) error {
 	c.logger.Debug("Starting signal_to_info_metric connector", zap.Int("rules", len(c.rules)), zap.Int("emit_groups", len(c.groups)))
+	if c.cfg.Storage != nil {
+		if err := c.startPersistence(ctx, host); err != nil {
+			return err
+		}
+	}
 	c.startEmitting()
 	return nil
 }
 
-// Shutdown stops the periodic emission and waits for it, bounded by ctx.
-// It is safe to call without Start and more than once.
+// Shutdown cancels the periodic emission, saves the state a last time and
+// closes the storage client, then waits for the emission to stop, all
+// bounded by ctx. The errors are joined. It is safe to call without Start
+// and more than once.
+//
+// The final save does not wait for a tick in progress, so a tick stuck in
+// the next consumer cannot use up the deadline before the save. This is
+// safe: a tick only reads the state under its lock and never uses the
+// store, and the collector shuts down the receivers of the logs pipeline
+// before the connector, so no ConsumeLogs runs during Shutdown.
 func (c *infoMetricConnector) Shutdown(ctx context.Context) error {
+	c.cancelEmitting()
+	var err error
+	if c.store != nil {
+		err = c.store.Shutdown(ctx)
+	}
+	err = errors.Join(err, c.waitEmitting(ctx))
 	c.tel.shutdown()
-	return c.stopEmitting(ctx)
+	return err
 }
 
 // Capabilities reports that the connector does not mutate its input. The

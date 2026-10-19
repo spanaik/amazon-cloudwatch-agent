@@ -6,6 +6,7 @@ package signaltoinfometricconnector
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"testing"
 
@@ -248,6 +249,45 @@ func TestEntitySizeEstimatesJSON(t *testing.T) {
 	estimate := entitySize(k, &e)
 	assert.GreaterOrEqual(t, estimate, actual, "%s", b)
 	assert.LessOrEqual(t, estimate, actual+64, "%s", b)
+
+	// Values that encoding/json escapes count with their escaped length,
+	// also in the state key.
+	identity = []kv{{Key: "k8s.pod.uid", Value: `<u&1>"\`}}
+	e.Identity = identity
+	e.Facts = []kv{{Key: "model", Value: strings.Repeat(`<&>"\`+"\x01\n \xff", 50)}}
+	k = encodeIdentity(identity)
+	b, err = json.Marshal(map[string]entity{k: e})
+	require.NoError(t, err)
+	actual = len(b) - 2
+	estimate = entitySize(k, &e)
+	assert.GreaterOrEqual(t, estimate, actual)
+	assert.LessOrEqual(t, estimate, actual+64)
+}
+
+// TestJSONStringLen compares jsonStringLen with encoding/json on every
+// single byte, on characters that need escaping, and on random strings.
+func TestJSONStringLen(t *testing.T) {
+	inputs := []string{
+		"", "plain", "meta-llama/Llama-3.1-70B-Instruct", `a"b\c`, "\b\f\n\r\t", "<>&", "\x00\x1f\x7f",
+		"é日本🙂", "\u2028\u2029", "\ufffd", "\xff", "\xe6\x97", "abc\xe6\x97\xa5\xe6", "\xed\xa0\x80",
+	}
+	for b := range 256 {
+		inputs = append(inputs, string([]byte{byte(b)}))
+	}
+	alphabet := []string{"a", "Z", "0", " ", `"`, `\`, "<", ">", "&", "\x00", "\n", "\x7f", "é", "日", "🙂", "\u2028", "\u2029", "\xff", "\xe6\x97", "\xc3"}
+	rnd := rand.New(rand.NewPCG(1, 2))
+	for range 2000 {
+		var sb strings.Builder
+		for range rnd.IntN(12) {
+			sb.WriteString(alphabet[rnd.IntN(len(alphabet))])
+		}
+		inputs = append(inputs, sb.String())
+	}
+	for _, s := range inputs {
+		b, err := json.Marshal(s)
+		require.NoError(t, err)
+		require.Equal(t, len(b)-2, jsonStringLen(s), "%q", s)
+	}
 }
 
 func TestStateMaxStateBytesEviction(t *testing.T) {

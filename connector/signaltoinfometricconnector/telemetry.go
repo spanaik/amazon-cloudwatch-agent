@@ -6,12 +6,15 @@ package signaltoinfometricconnector
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
+
+	"github.com/aws/amazon-cloudwatch-agent/internal/statestore"
 )
 
 // The connector's own telemetry. The instruments are hand-written in the
@@ -27,6 +30,10 @@ const (
 	metricEmitErrors        = telemetryPrefix + "emit_errors"
 	metricEntities          = telemetryPrefix + "entities"
 	metricStateBytes        = telemetryPrefix + "state_bytes"
+	metricStateSaves        = telemetryPrefix + "state_saves"
+	metricStateSaveErrors   = telemetryPrefix + "state_save_errors"
+	metricStateSaveRejected = telemetryPrefix + "state_save_rejected"
+	metricStateSavedBytes   = telemetryPrefix + "state_saved_bytes"
 )
 
 // Attribute keys of the connector's own telemetry.
@@ -91,15 +98,19 @@ type telemetry struct {
 	// rules is indexed like the connector rules.
 	rules []ruleAttrs
 
+	meter        otelmetric.Meter
 	registration otelmetric.Registration
-	unregister   sync.Once
+	// storeRegistration is the callback of the state store instruments. It
+	// is set by registerStore, only when storage is configured.
+	storeRegistration otelmetric.Registration
+	unregister        sync.Once
 }
 
 // newTelemetry creates the instruments and registers the callback of the
 // gauges, which reads s under its lock.
 func newTelemetry(mp otelmetric.MeterProvider, ruleNames []string, s *state) (*telemetry, error) {
 	meter := mp.Meter(scopeName)
-	t := &telemetry{rules: make([]ruleAttrs, len(ruleNames))}
+	t := &telemetry{rules: make([]ruleAttrs, len(ruleNames)), meter: meter}
 	var errs error
 	newCounter := func(name, desc, unit string) otelmetric.Int64Counter {
 		c, err := meter.Int64Counter(name, otelmetric.WithDescription(desc), otelmetric.WithUnit(unit))
@@ -165,12 +176,62 @@ func addOptions(attrs ...attribute.KeyValue) []otelmetric.AddOption {
 	return []otelmetric.AddOption{otelmetric.WithAttributeSet(attribute.NewSet(attrs...))}
 }
 
-// shutdown unregisters the callback of the gauges. It is safe to call more
-// than once.
+// registerStore creates the instruments of the state store and registers
+// their callback, which reads stats. The connector calls it in Start, only
+// when storage is configured.
+func (t *telemetry) registerStore(stats func() statestore.Stats) error {
+	var errs error
+	newCounter := func(name, desc, unit string) otelmetric.Int64ObservableCounter {
+		c, err := t.meter.Int64ObservableCounter(name, otelmetric.WithDescription(desc), otelmetric.WithUnit(unit))
+		errs = errors.Join(errs, err)
+		return c
+	}
+	saves := newCounter(metricStateSaves,
+		"Number of times the state was written to the storage extension.", "{saves}")
+	saveErrors := newCounter(metricStateSaveErrors,
+		"Number of state saves that failed in the snapshot, the encoding, or the storage write.", "{errors}")
+	rejected := newCounter(metricStateSaveRejected,
+		"Number of state saves refused because the record was larger than the limit.", "{saves}")
+	savedBytes, err := t.meter.Int64ObservableGauge(metricStateSavedBytes,
+		otelmetric.WithDescription("Size of the state record that was last loaded from or saved to the storage extension."),
+		otelmetric.WithUnit("By"))
+	errs = errors.Join(errs, err)
+	if errs != nil {
+		return errs
+	}
+	reg, err := t.meter.RegisterCallback(func(_ context.Context, o otelmetric.Observer) error {
+		s := stats()
+		o.ObserveInt64(saves, clampInt64(s.Saves))
+		o.ObserveInt64(saveErrors, clampInt64(s.SaveErrors))
+		o.ObserveInt64(rejected, clampInt64(s.Rejected))
+		o.ObserveInt64(savedBytes, int64(s.LastBytes))
+		return nil
+	}, saves, saveErrors, rejected, savedBytes)
+	if err != nil {
+		return err
+	}
+	t.storeRegistration = reg
+	return nil
+}
+
+// clampInt64 converts a counter to int64, with math.MaxInt64 for a value
+// that does not fit.
+func clampInt64(v uint64) int64 {
+	if v > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(v)
+}
+
+// shutdown unregisters the callbacks of the observable instruments. It is
+// safe to call more than once.
 func (t *telemetry) shutdown() {
 	t.unregister.Do(func() {
 		if t.registration != nil {
 			_ = t.registration.Unregister()
+		}
+		if t.storeRegistration != nil {
+			_ = t.storeRegistration.Unregister()
 		}
 	})
 }

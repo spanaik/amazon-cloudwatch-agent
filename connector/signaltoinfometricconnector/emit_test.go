@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 )
 
@@ -433,5 +434,52 @@ func TestEmitShutdownBoundedByContext(t *testing.T) {
 		close(next.release)
 		require.NoError(t, conn.Shutdown(context.Background()), "the group stops once the call returns")
 		assert.Equal(t, 1, next.calls())
+	})
+}
+
+// TestEmitCanceledIsNotAnError checks that a call to the next consumer that
+// fails because the emission context ended is logged at Debug and not
+// counted: a tick canceled by Shutdown, and an emission on change whose
+// ConsumeLogs context ended.
+func TestEmitCanceledIsNotAnError(t *testing.T) {
+	const msg = "Info metrics not sent: the emission was canceled"
+	t.Run("tick", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.EmitOnChange = false
+			next := &ctxConsumer{}
+			conn, tel, logs := newTelemetryConnector(t, cfg, next)
+			conn.jitter = func(time.Duration) time.Duration { return 0 }
+			require.NoError(t, conn.Start(t.Context(), componenttest.NewNopHost()))
+			require.NoError(t, conn.ConsumeLogs(t.Context(), podLogs("u1", base, "app started version=1")))
+			time.Sleep(startupEmitDelay)
+			synctest.Wait()
+			require.Equal(t, 1, next.calls(), "the first tick is in the next consumer")
+
+			require.NoError(t, conn.Shutdown(context.Background()))
+			got := collect(t, tel)
+			assert.NotContains(t, got, metricEmitErrors)
+			assert.NotContains(t, got, metricDatapointsEmitted)
+			assert.Zero(t, logs.FilterLevelExact(zapcore.WarnLevel).Len())
+			debugs := logs.FilterMessage(msg).All()
+			require.Len(t, debugs, 1)
+			assert.Equal(t, zapcore.DebugLevel, debugs[0].Level)
+			assert.Equal(t, "context canceled", debugs[0].ContextMap()["error"])
+			assert.Equal(t, "interval", debugs[0].ContextMap()["trigger"])
+		})
+	})
+
+	t.Run("change", func(t *testing.T) {
+		next := &ctxConsumer{}
+		conn, tel, logs := newTelemetryConnector(t, testConfig(), next)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		require.NoError(t, conn.ConsumeLogs(ctx, podLogs("u1", base, "app started version=1")))
+		require.Equal(t, 1, next.calls())
+		assert.NotContains(t, collect(t, tel), metricEmitErrors)
+		assert.Zero(t, logs.FilterLevelExact(zapcore.WarnLevel).Len())
+		require.Equal(t, 1, logs.FilterMessage(msg).Len())
+		assert.Equal(t, "change", logs.FilterMessage(msg).All()[0].ContextMap()["trigger"])
+		assert.Len(t, conn.state.snapshot().Rules["app_info"], 1, "the state is still updated")
 	})
 }
