@@ -197,7 +197,7 @@ func TestLoadMissing(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, found)
 	assert.Zero(t, got)
-	assert.Zero(t, s.Stats().Loads)
+	assert.Equal(t, Stats{}, s.Stats())
 	assert.Zero(t, logs.Len())
 }
 
@@ -215,7 +215,7 @@ func TestLoadRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, want, got)
-	assert.Equal(t, Stats{Loads: 1, LastBytes: len(c.stored(testKey))}, reader.Stats())
+	assert.Equal(t, Stats{LastBytes: len(c.stored(testKey))}, reader.Stats())
 
 	require.NoError(t, writer.Shutdown(context.Background()))
 }
@@ -253,7 +253,7 @@ func TestLoadCorrupt(t *testing.T) {
 			require.NoError(t, err)
 			assert.False(t, found)
 			assert.Zero(t, got)
-			assert.Zero(t, s.Stats().Loads)
+			assert.Equal(t, Stats{}, s.Stats())
 			assertDiscardLogged(t, logs, tc.reason)
 		})
 	}

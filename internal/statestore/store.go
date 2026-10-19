@@ -60,8 +60,6 @@ type Stats struct {
 	SaveErrors uint64
 	// Rejected counts saves refused with ErrTooLarge.
 	Rejected uint64
-	// Loads counts Load calls that returned a stored record.
-	Loads uint64
 	// LastBytes is the encoded size of the record most recently loaded or saved.
 	LastBytes int
 }
@@ -107,7 +105,6 @@ type Store[T any] struct {
 	saves      atomic.Uint64
 	saveErrors atomic.Uint64
 	rejected   atomic.Uint64
-	loads      atomic.Uint64
 	lastBytes  atomic.Int64
 }
 
@@ -160,7 +157,6 @@ func (s *Store[T]) Load(ctx context.Context) (T, bool, error) {
 		s.logger.Warn("discarding unreadable stored state", zap.Error(err), zap.Int("bytes", len(b)))
 		return zero, false, nil
 	}
-	s.loads.Add(1)
 	s.lastBytes.Store(int64(len(b)))
 	return data, true, nil
 }
@@ -243,9 +239,11 @@ func (s *Store[T]) run(ctx context.Context, done chan struct{}) {
 	}
 }
 
-// SaveNow snapshots and writes the record regardless of pending marks. It returns an error if Start
-// has not been called, ErrTooLarge (wrapped) if the record exceeds MaxBytes, or the snapshot or
-// storage error. A snapshot or storage failure leaves the marks pending so the saver retries.
+// SaveNow writes the record at once, not at the next pass of the saver. Use it when the record must
+// be in storage before the next step, for example before a planned stop or in tests. It writes the
+// record even when no mark is pending. It returns an error if Start has not been called, ErrTooLarge
+// (wrapped) if the record exceeds MaxBytes, or the snapshot or storage error. A snapshot or storage
+// failure leaves the marks pending so the saver retries.
 func (s *Store[T]) SaveNow(ctx context.Context) error {
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
@@ -397,7 +395,6 @@ func (s *Store[T]) Stats() Stats {
 		Saves:      s.saves.Load(),
 		SaveErrors: s.saveErrors.Load(),
 		Rejected:   s.rejected.Load(),
-		Loads:      s.loads.Load(),
 		LastBytes:  int(s.lastBytes.Load()),
 	}
 }

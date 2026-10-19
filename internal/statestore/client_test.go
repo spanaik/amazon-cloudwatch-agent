@@ -43,14 +43,15 @@ var _ storage.Extension = (*recordingStorage)(nil)
 
 func TestGetClientNilID(t *testing.T) {
 	client, err := GetClient(context.Background(), testHost{}, nil, component.KindConnector, component.MustNewID("my_connector"))
-	require.NoError(t, err)
-	assert.Equal(t, storage.NewNopClient(), client)
+	assert.EqualError(t, err, "statestore: no storage extension ID")
+	assert.Nil(t, client)
 }
 
 func TestGetClientMissingExtension(t *testing.T) {
 	storageID := component.MustNewIDWithName("file_storage", "missing")
-	_, err := GetClient(context.Background(), testHost{}, &storageID, component.KindConnector, component.MustNewID("my_connector"))
-	assert.EqualError(t, err, "storage extension 'file_storage/missing' not found")
+	client, err := GetClient(context.Background(), testHost{}, &storageID, component.KindConnector, component.MustNewID("my_connector"))
+	assert.EqualError(t, err, `statestore: storage extension "file_storage/missing" is not configured`)
+	assert.Nil(t, client)
 }
 
 func TestGetClientNonStorageExtension(t *testing.T) {
@@ -59,8 +60,9 @@ func TestGetClientNonStorageExtension(t *testing.T) {
 	require.NoError(t, err)
 	storageID := component.MustNewID("nop")
 
-	_, err = GetClient(context.Background(), testHost{storageID: nop}, &storageID, component.KindConnector, component.MustNewID("my_connector"))
-	assert.EqualError(t, err, "non-storage extension 'nop' found")
+	client, err := GetClient(context.Background(), testHost{storageID: nop}, &storageID, component.KindConnector, component.MustNewID("my_connector"))
+	assert.EqualError(t, err, `statestore: extension "nop" is not a storage extension`)
+	assert.Nil(t, client)
 }
 
 func TestGetClientPassesKindAndNormalizedID(t *testing.T) {

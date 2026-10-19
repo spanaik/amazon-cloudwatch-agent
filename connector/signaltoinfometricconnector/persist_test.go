@@ -595,8 +595,8 @@ func TestPersistStartErrors(t *testing.T) {
 		host component.Host
 		want string
 	}{
-		"missing_extension": {host: componenttest.NewNopHost(), want: "storage extension 'file_storage/state' not found"},
-		"not_storage":       {host: testHost{testStorageID: nop}, want: "non-storage extension 'file_storage/state' found"},
+		"missing_extension": {host: componenttest.NewNopHost(), want: `storage extension "file_storage/state" is not configured`},
+		"not_storage":       {host: testHost{testStorageID: nop}, want: `extension "file_storage/state" is not a storage extension`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			conn, _ := newStorageConnector(t, testConfig(), consumertest.NewNop())
@@ -935,13 +935,13 @@ func TestTelemetryRegisterStore(t *testing.T) {
 	assert.NotContains(t, got, metricStateSaves, "no store instruments without storage")
 
 	require.NoError(t, conn.tel.registerStore(func() statestore.Stats {
-		return statestore.Stats{Saves: 1, SaveErrors: 2, Rejected: 3, Loads: 4, LastBytes: 5}
+		return statestore.Stats{Saves: 1, SaveErrors: 2, Rejected: 3, LastBytes: 4}
 	}))
 	got = collect(t, tel)
 	assert.Equal(t, map[string]int64{"": 1}, got[metricStateSaves])
 	assert.Equal(t, map[string]int64{"": 2}, got[metricStateSaveErrors])
 	assert.Equal(t, map[string]int64{"": 3}, got[metricStateSaveRejected])
-	assert.Equal(t, map[string]int64{"": 5}, got[metricStateSavedBytes])
+	assert.Equal(t, map[string]int64{"": 4}, got[metricStateSavedBytes])
 }
 
 // ctxConsumer blocks every ConsumeMetrics call until its context ends, then

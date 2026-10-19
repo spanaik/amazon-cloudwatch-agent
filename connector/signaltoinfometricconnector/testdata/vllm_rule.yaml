@@ -1,3 +1,8 @@
+# This rule is the same as the rule that the aws-observability/helm-charts chart renders for
+# signal_to_info_metric/cw_k8s_ci_v0_vllm, in the template
+# charts/amazon-cloudwatch-observability/templates/linux/_otel-container-insights-config.tpl.
+# A change to one of them needs the same change in the other.
+#
 # The vLLM engine configuration rule with the expressions that the Helm chart renders, with all 14 facts.
 # The connector settings are at the top level (no component ID). The example in README.md has the same rule.
 identity_output_prefix: cwagent.info.identity.

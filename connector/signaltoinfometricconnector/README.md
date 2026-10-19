@@ -15,9 +15,9 @@ Initializing a V1 LLM engine (v0.11.0) with config: model='...', tensor_parallel
 
 | Status                   |                                   |
 | ------------------------ | --------------------------------- |
-| Stability                | [alpha]                           |
+| Stability                | alpha                             |
 | Supported pipeline types | exporter: logs, receiver: metrics |
-| Distributions            | [amazon-cloudwatch-agent]         |
+| Distributions            | amazon-cloudwatch-agent           |
 
 The connector does not change the logs that it consumes. Thus, it can share a logs pipeline with other exporters.
 
