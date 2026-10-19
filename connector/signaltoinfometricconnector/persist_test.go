@@ -306,7 +306,7 @@ func restoredEntities(snap stateSnapshot, rule string) map[string]restoredEntity
 }
 
 func TestPersistRestoreNormalizes(t *testing.T) {
-	podName := func(uid string) []kv { return []kv{{"k8s.pod.name", "pod-" + uid}} }
+	podName := func(uid string) []kv { return []kv{{"k8s.pod.name", "pod-" + uid}, {"k8s.pod.uid", uid}} }
 	asStored := map[string]restoredEntity{
 		"u1":   {resource: podName("u1"), facts: []kv{{"version", "1.2.3"}, {"mode", "fast"}, {"region", "eu"}}},
 		"u2":   {resource: podName("u2"), facts: []kv{{"version", "2"}, {"mode", "default"}}},
@@ -381,8 +381,8 @@ func TestPersistRestoreNormalizes(t *testing.T) {
 			// The identity u333 is longer than 3 bytes, so no record gives
 			// its key any more.
 			want: map[string]restoredEntity{
-				"u1": {resource: []kv{{"k8s.pod.name", "pod"}}, facts: []kv{{"version", "1.2"}, {"mode", "fas"}, {"region", "eu"}}},
-				"u2": {resource: []kv{{"k8s.pod.name", "pod"}}, facts: []kv{{"version", "2"}, {"mode", "def"}}},
+				"u1": {resource: []kv{{"k8s.pod.name", "pod"}, {"k8s.pod.uid", "u1"}}, facts: []kv{{"version", "1.2"}, {"mode", "fas"}, {"region", "eu"}}},
+				"u2": {resource: []kv{{"k8s.pod.name", "pod"}, {"k8s.pod.uid", "u2"}}, facts: []kv{{"version", "2"}, {"mode", "def"}}},
 			},
 			kept:       2,
 			dropped:    1,
@@ -394,11 +394,15 @@ func TestPersistRestoreNormalizes(t *testing.T) {
 				cfg.Rules[0].IncludeResourceAttributes = []string{"k8s.pod.uid", "k8s.pod.name"}
 			},
 			after: func(cfg *Config) {
-				cfg.Rules[0].IncludeResourceAttributes = []string{"k8s.namespace.name", "k8s.pod.name"}
+				cfg.Rules[0].IncludeResourceAttributes = []string{"k8s.namespace.name", "k8s.pod.uid"}
 			},
 			// The removed key is gone, and the added key has no value until
 			// a record brings it.
-			want:       asStored,
+			want: map[string]restoredEntity{
+				"u1":   {resource: []kv{{"k8s.pod.uid", "u1"}}, facts: asStored["u1"].facts},
+				"u2":   {resource: []kv{{"k8s.pod.uid", "u2"}}, facts: asStored["u2"].facts},
+				"u333": {resource: []kv{{"k8s.pod.uid", "u333"}}, facts: asStored["u333"].facts},
+			},
 			kept:       3,
 			normalized: 3,
 		},
@@ -697,7 +701,7 @@ func TestPersistStorageUnavailable(t *testing.T) {
 			require.NoError(t, conn.ConsumeLogs(ctx, podLogs("u1", base, "app started version=1")))
 			got := allSeries(t, sink.AllMetrics())
 			require.Len(t, got, 1, "emit on change")
-			assert.Equal(t, []kv{{"k8s.pod.name", "pod-u1"}, {"id.k8s.pod.uid", "u1"}}, got[0].resource)
+			assert.Equal(t, []kv{{"k8s.pod.name", "pod-u1"}, {"k8s.pod.uid", "u1"}}, got[0].resource)
 			assert.Equal(t, []kv{{"version", "1"}, {"mode", "default"}}, got[0].attrs)
 
 			metrics := collect(t, tel)

@@ -142,33 +142,25 @@ func (c *infoMetricConnector) tick(ctx context.Context, g *emitGroup) {
 }
 
 // buildMetrics returns one ResourceMetrics per entry. The resource has the
-// included resource attributes, then, when identity_output_prefix is set,
-// "<prefix><identity key>" for each identity key. The single gauge data
-// point has the value 1, the facts as attributes in config order, the emit
-// time as Timestamp, and FirstSeen as StartTimestamp. The record time is
-// never the Timestamp, because CloudWatch rejects data points older than
-// 14 days.
+// included resource attributes. The single gauge data point has the value
+// 1, the facts as attributes in config order, the emit time as Timestamp,
+// and FirstSeen as StartTimestamp. The record time is never the Timestamp,
+// because CloudWatch rejects data points older than 14 days.
 func (c *infoMetricConnector) buildMetrics(now time.Time, entries []emitEntry) pmetric.Metrics {
 	md := pmetric.NewMetrics()
 	rms := md.ResourceMetrics()
 	rms.EnsureCapacity(len(entries))
 	ts := pcommon.NewTimestampFromTime(now)
 	nowNanos := now.UnixNano()
-	prefix := c.cfg.IdentityOutputPrefix
 	for i := range entries {
 		e := &entries[i].entity
 		rule := c.rules[entries[i].rule].cfg
 
 		rm := rms.AppendEmpty()
 		res := rm.Resource().Attributes()
-		res.EnsureCapacity(len(e.Resource) + len(e.Identity))
+		res.EnsureCapacity(len(e.Resource))
 		for _, p := range e.Resource {
 			res.PutStr(p.Key, p.Value)
-		}
-		if prefix != "" {
-			for _, p := range e.Identity {
-				res.PutStr(c.cfg.identityOutputKey(p.Key), p.Value)
-			}
 		}
 
 		sm := rm.ScopeMetrics().AppendEmpty()

@@ -33,7 +33,6 @@ The connector does not change the logs that it consumes. Thus, it can share a lo
 | `max_state_bytes`        | Maximum size of the serialized state, in bytes. The connector uses a size estimate. Refer to [Entity state](#entity-state).          | `1048576` (1 MiB) | `65536` (64 KiB) to `67108864` (64 MiB) |
 | `max_value_length`       | Maximum length in bytes of each value: the facts, the included resource attributes, and the identity.                               | `256`             | `1` to `1024` (CloudWatch limit)        |
 | `error_mode`             | Action on OTTL evaluation errors at runtime: `propagate`, `ignore`, or `silent`. OTTL parse errors always stop the startup.         | `ignore`          | One of the three values.                |
-| `identity_output_prefix` | If set, the connector also emits each identity value as the resource attribute `<prefix><identity key>`.                           | `""`              |                                         |
 | `rules`                  | The rules. Refer to the next table.                                                                                                 | none              | Minimum one rule.                       |
 
 ### Rule settings
@@ -46,7 +45,7 @@ The connector does not change the logs that it consumes. Thus, it can share a lo
 | `body_contains`               | Substrings to find in the body. This is a plain substring check on a string body, with no OTTL and no regex. It runs before the conditions.                                       | `[]`      | Entries must not be empty.                             |
 | `conditions`                  | OTTL conditions on the log context, joined with OR.                                                                                                                               | `[]`      | Each condition must parse.                             |
 | `identity`                    | Resource attribute keys that identify an entity, for example `k8s.pod.uid`. The connector keeps the latest facts for each entity.                                                | none      | Minimum one key. No empty or duplicate keys.           |
-| `include_resource_attributes` | Resource attribute keys that the connector copies to the emitted metric. If `identity_output_prefix` is empty, this list must contain all identity keys. Without them, two entities can produce the same series. | `[]`      | No empty or duplicate keys.                            |
+| `include_resource_attributes` | Resource attribute keys that the connector copies to the emitted metric. Because the list contains the identity keys, two entities never give the same series.                    | `[]`      | Must contain all identity keys. No empty or duplicate keys. |
 | `attributes`                  | The facts to extract. Refer to the next table.                                                                                                                                    | none      | Minimum one. Maximum `max_attributes`.                 |
 | `emit_interval`               | Overrides the connector `emit_interval` for this rule. `0` uses the connector value.                                                                                             | `0`       | If set: `1s` to `24h`.                                 |
 | `max_entities`                | Maximum number of entities that this rule tracks. `0` uses the default.                                                                                                          | `0` (500) | If set: `1` to `100000`.                               |
@@ -71,8 +70,8 @@ no value, `optional` controls the result.
 
 ### Label budget
 
-Each data point has `len(attributes) + len(include_resource_attributes)` labels. If `identity_output_prefix` is
-set, add `len(identity)`. The total must be 150 or less. This is the CloudWatch limit for each data point.
+Each data point has `len(attributes) + len(include_resource_attributes)` labels. The total must be 150 or less.
+This is the CloudWatch limit for each data point.
 
 ### OTTL
 
@@ -93,7 +92,8 @@ The identity of the rule is the namespace, the pod name, and the container name.
 each container `/var/log/containers/<pod>_<namespace>_<container>-<id>.log`, and the filelog receiver reads the
 three names from the file name. Thus, every record has the identity, also before the k8sattributes processor knows
 the pod. The container name is in the identity, because two containers of one pod can each start an engine. The
-`include_resource_attributes` list has all the identity keys, so the example does not use `identity_output_prefix`.
+`include_resource_attributes` list has the three identity keys, because the connector requires all identity keys
+in this list.
 
 ```yaml
 extensions:
@@ -224,10 +224,9 @@ before it adds new entities. Thus, the eviction for a new entity uses the latest
 ### Emission
 
 Each entity is one series: a gauge with the value `1` and the rule name as metric name. The resource has the
-included resource attributes. If `identity_output_prefix` is set, the resource also has the identity. The data
-point attributes are the facts. The data point time is the emission time. The start time is the start of the
-series. The record time is never the data point time, because CloudWatch rejects data points that are older than
-14 days.
+included resource attributes, and thus also the identity. The data point attributes are the facts. The data point
+time is the emission time. The start time is the start of the series. The record time is never the data point
+time, because CloudWatch rejects data points that are older than 14 days.
 
 The connector emits in two ways:
 
@@ -283,6 +282,9 @@ then returns an error at startup, and the collector does not start. If the stora
 give the connector its storage, the connector logs an error and starts without persistence. This happens, for
 example, when `file_storage` cannot open or create its file. The log has the error and the `storage` ID. The
 connector then works as if `storage` is not set. The state is in memory only and does not survive a restart.
+The connector does not try the storage again during that run. At the next start, if the storage opens again, the
+connector restores the record from before the failure. The facts that the connector learned during the failure
+are then lost until the next matching record of each entity, for example the next vLLM engine startup line.
 
 The connector fits the restored state to the current configuration:
 

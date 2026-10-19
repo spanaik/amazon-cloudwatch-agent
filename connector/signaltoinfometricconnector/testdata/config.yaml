@@ -46,19 +46,16 @@ signal_to_info_metric/body_contains_only:
       body_contains: ["service started"]
       conditions: []
 
-# Valid: every bound at its limit, and an identity key that is not included
-# (allowed because identity_output_prefix is set).
+# Valid: every bound at its limit.
 signal_to_info_metric/limits:
   emit_interval: 1s
   emit_on_change: false
   max_state_bytes: 67108864
   max_value_length: 1024
   error_mode: propagate
-  identity_output_prefix: id.
   rules:
     - <<: *base_rule
       name: nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn
-      include_resource_attributes: [k8s.pod.name]
       emit_interval: 24h
       max_entities: 100000
       max_attributes: 128

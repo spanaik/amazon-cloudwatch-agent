@@ -41,7 +41,6 @@ func loadVLLMRuleFile(t testing.TB) *Config {
 // change a pattern.
 func TestVLLMRuleFile(t *testing.T) {
 	cfg := loadVLLMRuleFile(t)
-	assert.Empty(t, cfg.IdentityOutputPrefix, "the identity is in include_resource_attributes")
 	require.Len(t, cfg.Rules, 1)
 	rule := cfg.Rules[0]
 	assert.Equal(t, "vllm_engine_config_info", rule.Name)
@@ -99,9 +98,7 @@ func TestREADMEExample(t *testing.T) {
 	require.NotNil(t, cfg.Storage)
 	assert.Equal(t, "file_storage/state", cfg.Storage.String())
 	assert.Equal(t, 30*time.Second, cfg.EmitInterval)
-	want := loadVLLMRuleFile(t)
-	assert.Equal(t, want.IdentityOutputPrefix, cfg.IdentityOutputPrefix)
-	assert.Equal(t, want.Rules, cfg.Rules)
+	assert.Equal(t, loadVLLMRuleFile(t).Rules, cfg.Rules)
 }
 
 // fixture is one file of testdata/vllm, a container log in CRI format.

@@ -41,14 +41,13 @@ var base = time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
 // and region is optional.
 func testConfig() *Config {
 	cfg := createDefaultConfig().(*Config)
-	cfg.IdentityOutputPrefix = "id."
 	cfg.Rules = []RuleConfig{{
 		Name:                      "app_info",
 		Description:               "App configuration.",
 		Unit:                      "1",
 		BodyContains:              []string{"app started"},
 		Identity:                  []string{"k8s.pod.uid"},
-		IncludeResourceAttributes: []string{"k8s.pod.name"},
+		IncludeResourceAttributes: []string{"k8s.pod.name", "k8s.pod.uid"},
 		Attributes: []AttributeConfig{
 			{Key: "version", Value: `ExtractPatterns(log.body, "version=(?P<v>\\S+)")["v"]`},
 			{Key: "mode", Value: `ExtractPatterns(log.body, "mode=(?P<v>\\S+)")["v"]`, DefaultValue: "default"},
@@ -186,7 +185,7 @@ func TestConsumeLogsEmitsOnInsert(t *testing.T) {
 	got := allSeries(t, sink.AllMetrics())
 	require.Len(t, got, 1)
 	assert.Equal(t, series{
-		resource:       []kv{{"k8s.pod.name", "pod-u1"}, {"id.k8s.pod.uid", "u1"}},
+		resource:       []kv{{"k8s.pod.name", "pod-u1"}, {"k8s.pod.uid", "u1"}},
 		name:           "app_info",
 		start:          ts,
 		ts:             testNow,
@@ -381,7 +380,7 @@ func TestConsumeLogsTruncatesResourceAndIdentity(t *testing.T) {
 	require.NoError(t, conn.ConsumeLogs(t.Context(), podLogs("uid-éé", base, "app started version=1.2.3")))
 	got := allSeries(t, sink.AllMetrics())
 	require.Len(t, got, 1)
-	assert.Equal(t, []kv{{"k8s.pod.name", "pod-u"}, {"id.k8s.pod.uid", "uid-"}}, got[0].resource)
+	assert.Equal(t, []kv{{"k8s.pod.name", "pod-u"}, {"k8s.pod.uid", "uid-"}}, got[0].resource)
 	assert.Equal(t, []kv{{"version", "1.2.3"}, {"mode", "dflt"}}, got[0].attrs)
 }
 

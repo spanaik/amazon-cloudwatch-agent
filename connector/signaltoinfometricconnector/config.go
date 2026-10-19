@@ -82,9 +82,6 @@ type Config struct {
 	// that a bad record never fails the logs pipeline the connector shares
 	// with other exporters.
 	ErrorMode ottl.ErrorMode `mapstructure:"error_mode"`
-	// IdentityOutputPrefix, when set, makes the connector emit each identity
-	// value as a resource attribute named "<prefix><identity key>".
-	IdentityOutputPrefix string `mapstructure:"identity_output_prefix"`
 	// Rules define which log records produce which Info metric.
 	Rules []RuleConfig `mapstructure:"rules"`
 }
@@ -178,7 +175,6 @@ func (cfg *Config) Validate() error {
 		return errors.Join(errs...)
 	}
 
-	identityOutput := cfg.IdentityOutputPrefix != ""
 	firstRuleWithName := make(map[string]int, len(cfg.Rules))
 	for i := range cfg.Rules {
 		rule := &cfg.Rules[i]
@@ -190,7 +186,7 @@ func (cfg *Config) Validate() error {
 				firstRuleWithName[rule.Name] = i
 			}
 		}
-		ruleErrs = append(ruleErrs, rule.validate(&parser, identityOutput, cfg.MaxValueLength)...)
+		ruleErrs = append(ruleErrs, rule.validate(&parser, cfg.MaxValueLength)...)
 		for _, e := range ruleErrs {
 			errs = append(errs, fmt.Errorf("%s: %w", rule.label(i), e))
 		}
@@ -199,16 +195,10 @@ func (cfg *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-// identityOutputKey returns the resource attribute key under which an
-// identity value is emitted when IdentityOutputPrefix is set.
-func (cfg *Config) identityOutputKey(identityKey string) string {
-	return cfg.IdentityOutputPrefix + identityKey
-}
-
 // validate checks a single rule. It is not named Validate so that
 // xconfmap.Validate does not run it a second time. maxValueLength is the
 // connector max_value_length.
-func (r *RuleConfig) validate(parser *ottl.Parser[*ottllog.TransformContext], identityOutput bool, maxValueLength int) []error {
+func (r *RuleConfig) validate(parser *ottl.Parser[*ottllog.TransformContext], maxValueLength int) []error {
 	var errs []error
 
 	switch {
@@ -251,23 +241,24 @@ func (r *RuleConfig) validate(parser *ottl.Parser[*ottllog.TransformContext], id
 	}
 	errs = append(errs, validateKeyList("identity", r.Identity)...)
 	errs = append(errs, validateKeyList("include_resource_attributes", r.IncludeResourceAttributes)...)
-	if !identityOutput {
-		included := make(map[string]struct{}, len(r.IncludeResourceAttributes))
-		for _, k := range r.IncludeResourceAttributes {
-			included[k] = struct{}{}
+	// The emitted resource has only the included resource attributes, so
+	// every identity key must be one of them. Otherwise two entities that
+	// differ only in that key give the same series.
+	included := make(map[string]struct{}, len(r.IncludeResourceAttributes))
+	for _, k := range r.IncludeResourceAttributes {
+		included[k] = struct{}{}
+	}
+	reported := make(map[string]struct{}, len(r.Identity))
+	for _, k := range r.Identity {
+		if k == "" {
+			continue
 		}
-		reported := make(map[string]struct{}, len(r.Identity))
-		for _, k := range r.Identity {
-			if k == "" {
-				continue
-			}
-			_, ok := included[k]
-			_, done := reported[k]
-			if !ok && !done {
-				reported[k] = struct{}{}
-				errs = append(errs, fmt.Errorf("identity key %q must also be listed in include_resource_attributes "+
-					"when identity_output_prefix is empty; otherwise different entities could produce the same series", k))
-			}
+		_, ok := included[k]
+		_, done := reported[k]
+		if !ok && !done {
+			reported[k] = struct{}{}
+			errs = append(errs, fmt.Errorf("identity key %q must also be listed in include_resource_attributes, "+
+				"so that two entities never give the same series", k))
 		}
 	}
 
@@ -303,9 +294,9 @@ func (r *RuleConfig) validate(parser *ottl.Parser[*ottllog.TransformContext], id
 		}
 	}
 
-	if n := r.labelCount(identityOutput); n > maxLabelsPerDatapoint {
-		errs = append(errs, fmt.Errorf("would emit %d labels per data point (attributes + include_resource_attributes"+
-			" + identity when identity_output_prefix is set), more than the CloudWatch limit of %d", n, maxLabelsPerDatapoint))
+	if n := r.labelCount(); n > maxLabelsPerDatapoint {
+		errs = append(errs, fmt.Errorf("would emit %d labels per data point (attributes + include_resource_attributes),"+
+			" more than the CloudWatch limit of %d", n, maxLabelsPerDatapoint))
 	}
 
 	return errs
@@ -345,14 +336,9 @@ func (r *RuleConfig) effectiveMaxAttributes() int {
 }
 
 // labelCount returns the number of labels each emitted data point carries:
-// the extracted attributes, the included resource attributes, and, when
-// identityOutput is set, the prefixed identity attributes.
-func (r *RuleConfig) labelCount(identityOutput bool) int {
-	n := len(r.Attributes) + len(r.IncludeResourceAttributes)
-	if identityOutput {
-		n += len(r.Identity)
-	}
-	return n
+// the extracted attributes and the included resource attributes.
+func (r *RuleConfig) labelCount() int {
+	return len(r.Attributes) + len(r.IncludeResourceAttributes)
 }
 
 // valueExpression returns the OTTL value expression for the attribute,

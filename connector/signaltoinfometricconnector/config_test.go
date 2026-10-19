@@ -44,7 +44,6 @@ func TestLoadConfig(t *testing.T) {
 	storageID := component.MustNewIDWithName("file_storage", "state")
 	limitsRule := baseRule()
 	limitsRule.Name = strings.Repeat("n", maxRuleNameLength)
-	limitsRule.IncludeResourceAttributes = []string{"k8s.pod.name"}
 	limitsRule.EmitInterval = maxEmitInterval
 	limitsRule.MaxEntities = maxMaxEntities
 	limitsRule.MaxAttributes = maxMaxAttributes
@@ -107,13 +106,12 @@ func TestLoadConfig(t *testing.T) {
 		{
 			name: "limits",
 			want: &Config{
-				EmitInterval:         minEmitInterval,
-				EmitOnChange:         false,
-				MaxStateBytes:        maxMaxStateBytes,
-				MaxValueLength:       maxMaxValueLength,
-				ErrorMode:            ottl.PropagateError,
-				IdentityOutputPrefix: "id.",
-				Rules:                []RuleConfig{limitsRule, lowerLimitsRule},
+				EmitInterval:   minEmitInterval,
+				EmitOnChange:   false,
+				MaxStateBytes:  maxMaxStateBytes,
+				MaxValueLength: maxMaxValueLength,
+				ErrorMode:      ottl.PropagateError,
+				Rules:          []RuleConfig{limitsRule, lowerLimitsRule},
 			},
 		},
 		{name: "no_rules", errContains: []string{"at least one rule must be configured"}},
@@ -141,7 +139,7 @@ func TestLoadConfig(t *testing.T) {
 		{name: "no_identity", errContains: []string{"rules[0] (example_info): identity must list at least one resource attribute key"}},
 		{name: "empty_identity_key", errContains: []string{"rules[0] (example_info): identity[1] must not be empty"}},
 		{name: "duplicate_identity_key", errContains: []string{`identity[1]: duplicate key "k8s.pod.uid", already listed at identity[0]`}},
-		{name: "identity_not_included", errContains: []string{`identity key "k8s.pod.uid" must also be listed in include_resource_attributes when identity_output_prefix is empty`}},
+		{name: "identity_not_included", errContains: []string{`rules[0] (example_info): identity key "k8s.pod.uid" must also be listed in include_resource_attributes, so that two entities never give the same series`}},
 		{name: "empty_include_key", errContains: []string{"rules[0] (example_info): include_resource_attributes[1] must not be empty"}},
 		{name: "duplicate_include_key", errContains: []string{`include_resource_attributes[2]: duplicate key "k8s.pod.name", already listed at include_resource_attributes[1]`}},
 		{name: "no_attributes", errContains: []string{"rules[0] (example_info): at least one attribute is required"}},
@@ -266,7 +264,6 @@ func TestValidateLabelBudget(t *testing.T) {
 	}
 	testCases := []struct {
 		name       string
-		prefix     string
 		attrs      int
 		included   int
 		wantErr    bool
@@ -274,15 +271,12 @@ func TestValidateLabelBudget(t *testing.T) {
 	}{
 		{name: "at_limit", attrs: 32, included: 118, wantLabels: 150},
 		{name: "over_limit", attrs: 32, included: 119, wantLabels: 151, wantErr: true},
-		{name: "at_limit_with_identity_output", prefix: "id.", attrs: 32, included: 117, wantLabels: 150},
-		{name: "over_limit_with_identity_output", prefix: "id.", attrs: 32, included: 118, wantLabels: 151, wantErr: true},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := validConfig()
-			cfg.IdentityOutputPrefix = tc.prefix
 			cfg.Rules = []RuleConfig{ruleWithLabels(tc.attrs, tc.included)}
-			assert.Equal(t, tc.wantLabels, cfg.Rules[0].labelCount(tc.prefix != ""))
+			assert.Equal(t, tc.wantLabels, cfg.Rules[0].labelCount())
 			err := cfg.Validate()
 			if !tc.wantErr {
 				assert.NoError(t, err)
@@ -305,9 +299,6 @@ func TestRuleDefaults(t *testing.T) {
 	assert.Equal(t, 5*time.Minute, rule.effectiveEmitInterval(defaultEmitInterval))
 	assert.Equal(t, 7, rule.effectiveMaxEntities())
 	assert.Equal(t, 3, rule.effectiveMaxAttributes())
-
-	cfg := &Config{IdentityOutputPrefix: "cwagent.info.identity."}
-	assert.Equal(t, "cwagent.info.identity.k8s.pod.uid", cfg.identityOutputKey("k8s.pod.uid"))
 }
 
 func TestAttributeDefaultValueExpression(t *testing.T) {
