@@ -85,7 +85,7 @@ func TestLoadConfig(t *testing.T) {
 					Identity:                  []string{"k8s.pod.uid"},
 					IncludeResourceAttributes: []string{"k8s.pod.name", "k8s.namespace.name", "k8s.container.name"},
 					Attributes: []AttributeConfig{
-						{Key: "vllm_version", Value: `ExtractPatterns(log.body, "\\(v(?P<v>[^)]+)\\) with config")["v"]`},
+						{Key: "vllm_version", Value: `ExtractPatterns(log.body, "Initializing an? (?:V[01] )?LLM engine \\(v(?P<v>[^)]+)\\) with config: ")["v"]`},
 						{Key: "vllm_engine", Value: `ExtractPatterns(log.body, "Initializing a (?P<v>V[01]) LLM engine")["v"]`, DefaultValue: "V0"},
 						{Key: "tensor_parallel_size", Value: `ExtractPatterns(log.body, ", tensor_parallel_size=(?P<v>\\d+),")["v"]`, Optional: true},
 					},

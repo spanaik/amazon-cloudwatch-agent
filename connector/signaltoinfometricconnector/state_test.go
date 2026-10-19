@@ -43,6 +43,18 @@ func ref(rule int, uid string) entityRef {
 	return entityRef{rule: rule, key: key(uid)}
 }
 
+// refs returns the entities of evictions, without the reasons.
+func refs(evicted []eviction) []entityRef {
+	if evicted == nil {
+		return nil
+	}
+	out := make([]entityRef, len(evicted))
+	for i, e := range evicted {
+		out[i] = e.entityRef
+	}
+	return out
+}
+
 func getEntity(s *state, rule int, uid string) (entity, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -173,14 +185,14 @@ func TestStateMaxEntitiesEviction(t *testing.T) {
 	// At the limit, an insert evicts the least active entity: u2.
 	res := s.apply(obs(0, "u4", "1", 500))
 	assert.Equal(t, outcomeInserted, res.outcome)
-	assert.Equal(t, []entityRef{ref(0, "u2")}, res.evicted)
+	assert.Equal(t, []entityRef{ref(0, "u2")}, refs(res.evicted))
 	// Then u3.
 	res = s.apply(obs(0, "u5", "1", 50))
-	assert.Equal(t, []entityRef{ref(0, "u3")}, res.evicted)
+	assert.Equal(t, []entityRef{ref(0, "u3")}, refs(res.evicted))
 	// A new entity is always admitted, even if it is older than the rest; it
 	// is then the least active, so it goes first.
 	res = s.apply(obs(0, "u6", "1", 600))
-	assert.Equal(t, []entityRef{ref(0, "u5")}, res.evicted)
+	assert.Equal(t, []entityRef{ref(0, "u5")}, refs(res.evicted))
 	_, ok := getEntity(s, 1, "u0")
 	assert.True(t, ok)
 	assert.Equal(t, 4, entityCount(s))
@@ -191,7 +203,7 @@ func TestStateMaxEntitiesEviction(t *testing.T) {
 	s.apply(obs(0, "ub", "1", 100))
 	s.apply(obs(0, "ua", "1", 100))
 	res = s.apply(obs(0, "uc", "1", 100))
-	assert.Equal(t, []entityRef{ref(0, "ua")}, res.evicted)
+	assert.Equal(t, []entityRef{ref(0, "ua")}, refs(res.evicted))
 
 	// A change does not evict for max_entities.
 	res = s.apply(obs(0, "ub", "2", 200))
@@ -251,7 +263,7 @@ func TestStateMaxStateBytesEviction(t *testing.T) {
 	// The fourth evicts the least active entity across all rules: u2 of rule 1.
 	res := s.apply(obs(0, "u4", "1", 400))
 	assert.Equal(t, outcomeInserted, res.outcome)
-	assert.Equal(t, []entityRef{ref(1, "u2")}, res.evicted)
+	assert.Equal(t, []entityRef{ref(1, "u2")}, refs(res.evicted))
 	checkBytes(t, s)
 
 	// A change that grows an entity evicts others, never the entity itself.
@@ -259,7 +271,7 @@ func TestStateMaxStateBytesEviction(t *testing.T) {
 	grow := obs(0, "u4", strings.Repeat("v", 2*size), 500)
 	res = s.apply(grow)
 	assert.Equal(t, outcomeChanged, res.outcome)
-	assert.Equal(t, []entityRef{ref(0, "u3"), ref(0, "u1")}, res.evicted)
+	assert.Equal(t, []entityRef{ref(0, "u3"), ref(0, "u1")}, refs(res.evicted))
 	got, ok := getEntity(s, 0, "u4")
 	require.True(t, ok)
 	assert.Equal(t, grow.facts, got.Facts)
@@ -285,7 +297,7 @@ func TestStateEntityTooLarge(t *testing.T) {
 	// A change that makes an entity too large removes its stale facts.
 	res = s.apply(obs(0, "u1", huge, 300))
 	assert.Equal(t, outcomeTooLarge, res.outcome)
-	assert.Equal(t, []entityRef{ref(0, "u1")}, res.evicted)
+	assert.Equal(t, []entityRef{ref(0, "u1")}, refs(res.evicted))
 	assert.Equal(t, 0, entityCount(s))
 	checkBytes(t, s)
 	assert.Equal(t, 0, s.bytes)
@@ -305,12 +317,12 @@ func TestStateApplyBatch(t *testing.T) {
 		obs(1, "u1", "1", 100), // inserted, other rule
 		obs(0, "u2", "1", 300), // unchanged
 		obs(0, "u3", "1", 400), // inserted, evicts u1 (activity 200 < u2's 300)
-	}, true)
+	}, nil, true)
 	assert.Equal(t, 4, res.counts[outcomeInserted])
 	assert.Equal(t, 1, res.counts[outcomeChanged])
 	assert.Equal(t, 1, res.counts[outcomeUnchanged])
 	assert.Equal(t, 1, res.counts[outcomeIgnoredOlder])
-	assert.Equal(t, []entityRef{ref(0, "u1")}, res.evicted)
+	assert.Equal(t, []entityRef{ref(0, "u1")}, refs(res.evicted))
 	// u1 of rule 0 was evicted later in the batch, so it is not emitted.
 	require.Len(t, res.changed, 3)
 	assert.Equal(t, 0, res.changed[0].rule)
@@ -321,13 +333,13 @@ func TestStateApplyBatch(t *testing.T) {
 	assert.Equal(t, "u3", res.changed[2].entity.Identity[0].Value)
 
 	// Without collect, nothing is copied.
-	res = s.applyBatch([]observation{obs(0, "u9", "1", 500)}, false)
+	res = s.applyBatch([]observation{obs(0, "u9", "1", 500)}, nil, false)
 	assert.Equal(t, 1, res.counts[outcomeInserted])
 	assert.Empty(t, res.changed)
 
 	// The final value of an entity changed twice in a batch is emitted.
 	s = newState(testSpecs(2), defaultMaxStateBytes)
-	res = s.applyBatch([]observation{obs(0, "u1", "1", 100), obs(0, "u1", "2", 200)}, true)
+	res = s.applyBatch([]observation{obs(0, "u1", "1", 100), obs(0, "u1", "2", 200)}, nil, true)
 	require.Len(t, res.changed, 1)
 	assert.Equal(t, []kv{{Key: "version", Value: "2"}}, res.changed[0].entity.Facts)
 	assert.Equal(t, int64(200), res.changed[0].entity.FirstSeen)
@@ -444,4 +456,130 @@ func TestStateManyEntities(t *testing.T) {
 	_, ok = getEntity(s, 0, "uid-0004")
 	assert.True(t, ok)
 	checkBytes(t, s)
+}
+
+// touches returns an activityBatch with one touch per uid of rule, all at
+// time t.
+func touches(rule int, t int64, uids ...string) *activityBatch {
+	act := &activityBatch{}
+	for _, uid := range uids {
+		from := len(act.keys)
+		act.keys = append(act.keys, key(uid)...)
+		act.touches = append(act.touches, touch{rule: rule, from: from, to: len(act.keys), time: t})
+	}
+	return act
+}
+
+func TestStateApplyBatchActivity(t *testing.T) {
+	s := newState(testSpecs(2), defaultMaxStateBytes)
+	s.apply(obs(0, "u1", "1", 100))
+	s.apply(obs(0, "u2", "1", 200))
+
+	// u1 is touched at 300 in the batch that inserts u3: the touches go
+	// first, so u2 is the least active and is evicted.
+	res := s.applyBatch([]observation{obs(0, "u3", "1", 400)}, touches(0, 300, "u1", "u3", "unknown"), false)
+	assert.True(t, res.touched)
+	assert.Equal(t, []eviction{{entityRef: ref(0, "u2"), reason: evictMaxEntities}}, res.evicted)
+	got, ok := getEntity(s, 0, "u1")
+	require.True(t, ok)
+	assert.Equal(t, int64(300), got.Activity)
+	assert.Equal(t, int64(100), got.Updated, "a touch changes only the activity")
+	got, _ = getEntity(s, 0, "u3")
+	assert.Equal(t, int64(400), got.Activity, "u3 did not exist when the touches were applied")
+
+	// Older and equal touches do not move the activity, and a touch of
+	// another rule does not apply to this rule.
+	res = s.applyBatch(nil, touches(0, 300, "u1"), false)
+	assert.False(t, res.touched)
+	res = s.applyBatch(nil, touches(1, 500, "u1"), false)
+	assert.False(t, res.touched)
+	got, _ = getEntity(s, 0, "u1")
+	assert.Equal(t, int64(300), got.Activity)
+
+	// Observations report movement too: same facts later moves Updated
+	// and Activity, an older record moves neither.
+	res = s.applyBatch([]observation{obs(0, "u1", "1", 350)}, nil, false)
+	assert.True(t, res.touched)
+	assert.False(t, res.stateChanged())
+	res = s.applyBatch([]observation{obs(0, "u1", "0", 200)}, nil, false)
+	assert.False(t, res.touched)
+	assert.False(t, res.stateChanged())
+	// An older record with a later activity than stored moves the activity.
+	s.apply(obs(0, "u1", "2", 1000))
+	res = s.applyBatch(nil, touches(0, 2000, "u1"), false)
+	assert.True(t, res.touched)
+	res = s.applyBatch([]observation{obs(0, "u1", "3", 3000)}, nil, false)
+	assert.True(t, res.stateChanged())
+}
+
+func TestStateEvictionReasons(t *testing.T) {
+	o := obs(0, "u1", "1", 0)
+	size := entitySize(o.key, &entity{Identity: o.identity, Resource: o.resource, Facts: o.facts})
+	s := newState(testSpecs(2), 3*size+size/2)
+	s.apply(obs(0, "u1", "1", 100))
+	s.apply(obs(0, "u2", "1", 200))
+	s.apply(obs(1, "u3", "1", 300))
+
+	res := s.applyBatch([]observation{
+		obs(0, "u4", "1", 400),                         // max_entities evicts u1
+		obs(1, "u5", "1", 500),                         // max_state_bytes evicts u2
+		obs(1, "u6", strings.Repeat("x", 4*size), 1),   // too large, not stored
+		obs(1, "u5", strings.Repeat("x", 4*size), 600), // too large, removed
+	}, nil, false)
+	assert.Equal(t, []eviction{
+		{entityRef: ref(0, "u1"), reason: evictMaxEntities},
+		{entityRef: ref(0, "u2"), reason: evictMaxStateBytes},
+		{entityRef: ref(1, "u5"), reason: evictTooLarge},
+	}, res.evicted)
+	assert.Equal(t, []entityRef{ref(1, "u6")}, res.rejected)
+	assert.Equal(t, 2, res.counts[outcomeTooLarge])
+	assert.True(t, res.stateChanged())
+	checkBytes(t, s)
+}
+
+func TestStateTracked(t *testing.T) {
+	s := newState(testSpecs(2), defaultMaxStateBytes)
+	tracked := func() []int64 {
+		return []int64{s.tracked[0].Load(), s.tracked[1].Load()}
+	}
+	assert.False(t, s.tracking())
+	s.apply(obs(1, "u1", "1", 100))
+	assert.True(t, s.tracking())
+	assert.False(t, s.ruleTracked(0))
+	assert.True(t, s.ruleTracked(1))
+	s.apply(obs(1, "u2", "1", 200))
+	s.apply(obs(1, "u3", "1", 300))
+	assert.Equal(t, []int64{0, 2}, tracked(), "max_entities evicted one")
+	s.apply(obs(1, "u3", strings.Repeat("x", defaultMaxStateBytes), 400))
+	assert.Equal(t, []int64{0, 1}, tracked(), "too large removed one")
+
+	snap := s.snapshot()
+	s.apply(obs(0, "u9", "1", 1))
+	s.restore(snap)
+	assert.Equal(t, []int64{0, 1}, tracked())
+	s.restore(stateSnapshot{})
+	assert.Equal(t, []int64{0, 0}, tracked())
+	assert.False(t, s.tracking())
+}
+
+func TestStateEntriesAndSizes(t *testing.T) {
+	s := newState(testSpecs(10), defaultMaxStateBytes)
+	assert.Nil(t, s.entries([]int{0, 1}))
+	s.apply(obs(1, "u2", "1", 100))
+	s.apply(obs(0, "u3", "1", 100))
+	s.apply(obs(1, "u1", "1", 100))
+	s.apply(obs(0, "u1", "2", 100))
+
+	got := s.entries([]int{1, 0})
+	var names []string
+	for _, e := range got {
+		names = append(names, fmt.Sprintf("%d/%s/%s", e.rule, e.entity.Identity[0].Value, e.entity.Facts[0].Value))
+		assert.Equal(t, encodeIdentity(e.entity.Identity), e.key)
+	}
+	assert.Equal(t, []string{"0/u1/2", "0/u3/1", "1/u1/1", "1/u2/1"}, names)
+	assert.Len(t, s.entries([]int{1}), 2)
+
+	counts := make([]int, 2)
+	assert.Equal(t, s.bytes, s.sizes(counts))
+	assert.Equal(t, []int{2, 2}, counts)
 }

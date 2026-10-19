@@ -330,3 +330,59 @@ func BenchmarkConsumeLogsNoMatch(b *testing.B) {
 	}
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(n*records), "ns/record")
 }
+
+// vllmStartupLine is a startup line that the vLLM rule uses.
+const vllmStartupLine = "INFO 10-15 12:00:00 [core.py:77] Initializing a V1 LLM engine (v0.11.0) with config: model='m', tensor_parallel_size=1, seed=0"
+
+// trackedActivityLogs returns pods ResourceLogs with perPod non-matching
+// records each. The pods are u00, u01, and so on.
+func trackedActivityLogs(pods, perPod int) plog.Logs {
+	ld := plog.NewLogs()
+	for p := range pods {
+		lrs := addResource(ld, podResource(fmt.Sprintf("u%02d", p)))
+		for i := range perPod {
+			addRecord(lrs, base.Add(time.Duration(i)*time.Millisecond), noMatchBodies[(p+i)%len(noMatchBodies)])
+		}
+	}
+	return ld
+}
+
+// newTrackedConnector returns a connector with the vLLM rule that tracks
+// pods u00 to u<pods-1>, inserted an hour before base.
+func newTrackedConnector(tb testing.TB, pods int) *infoMetricConnector {
+	tb.Helper()
+	conn, err := newConnector(connectortest.NewNopSettings(component.MustNewType(TypeStr)), loadVLLMRuleFile(tb), consumertest.NewNop())
+	require.NoError(tb, err)
+	ld := plog.NewLogs()
+	for p := range pods {
+		addRecord(addResource(ld, podResource(fmt.Sprintf("u%02d", p))), base.Add(-time.Hour), vllmStartupLine)
+	}
+	require.NoError(tb, conn.ConsumeLogs(context.Background(), ld))
+	require.Len(tb, conn.state.snapshot().Rules["vllm_engine_config_info"], pods)
+	return conn
+}
+
+// BenchmarkConsumeLogsTrackedActivity measures the activity path: a batch of
+// 1000 non-matching records over 20 ResourceLogs, each of a tracked pod.
+// After the first call, the Activity of every pod is current, which is the
+// steady state.
+func BenchmarkConsumeLogsTrackedActivity(b *testing.B) {
+	const (
+		pods    = 20
+		perPod  = 50
+		records = pods * perPod
+	)
+	conn := newTrackedConnector(b, pods)
+	ld := trackedActivityLogs(pods, perPod)
+	ld.MarkReadOnly()
+	ctx := context.Background()
+	b.ReportAllocs()
+	n := 0
+	for b.Loop() {
+		if err := conn.ConsumeLogs(ctx, ld); err != nil {
+			b.Fatal(err)
+		}
+		n++
+	}
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(n*records), "ns/record")
+}

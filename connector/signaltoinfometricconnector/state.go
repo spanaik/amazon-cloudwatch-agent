@@ -7,6 +7,7 @@ import (
 	"cmp"
 	"slices"
 	"sync"
+	"sync/atomic"
 )
 
 // Size estimate of the serialized state, used for max_state_bytes. The
@@ -93,17 +94,41 @@ type entityRef struct {
 	key  string
 }
 
+// evictReason is why an entity left the state.
+type evictReason uint8
+
+const (
+	// evictMaxEntities: a new entity of the same rule needed room.
+	evictMaxEntities evictReason = iota
+	// evictMaxStateBytes: the state was over max_state_bytes.
+	evictMaxStateBytes
+	// evictTooLarge: a change made the entity alone exceed max_state_bytes.
+	evictTooLarge
+
+	numEvictReasons
+)
+
+// eviction is an entity removed from the state.
+type eviction struct {
+	entityRef
+	reason evictReason
+}
+
 // applyResult is the result of applying one observation.
 type applyResult struct {
 	outcome outcome
 	// evicted lists the entities removed to make room, and the entity
 	// itself when a change made it too large.
-	evicted []entityRef
+	evicted []eviction
+	// touched is set when the Activity or Updated time of an existing
+	// entity moved forward.
+	touched bool
 }
 
 // emitEntry is a copy of an entity to emit.
 type emitEntry struct {
 	rule   int
+	key    string
 	entity entity
 }
 
@@ -111,11 +136,65 @@ type emitEntry struct {
 type batchResult struct {
 	// counts is indexed by outcome.
 	counts  [numOutcomes]int
-	evicted []entityRef
+	evicted []eviction
+	// rejected lists the new entities that were not stored because each
+	// alone exceeds max_state_bytes.
+	rejected []entityRef
 	// changed holds copies of the entities inserted or changed by the
 	// batch that still exist after it, in order of their first change.
 	// It is filled only when requested.
 	changed []emitEntry
+	// touched is set when the batch moved the Activity or Updated time of
+	// an existing entity forward.
+	touched bool
+}
+
+// stateChanged reports whether the batch changed the stored facts or the
+// set of entities: an insert, a change, an eviction, or an entity that was
+// too large.
+func (r *batchResult) stateChanged() bool {
+	return r.counts[outcomeInserted] > 0 || r.counts[outcomeChanged] > 0 ||
+		r.counts[outcomeTooLarge] > 0 || len(r.evicted) > 0
+}
+
+// touch says that the entity of a rule whose state key is keys[from:to]
+// had a record at time (Unix nanoseconds).
+type touch struct {
+	rule     int
+	from, to int
+	time     int64
+}
+
+// activityBatch holds the touches of one ConsumeLogs call. The keys of all
+// touches share one buffer, so that collecting them does not allocate once
+// the buffers have grown.
+type activityBatch struct {
+	keys    []byte
+	touches []touch
+	// now is the current time in Unix nanoseconds, read once per batch
+	// when the first touch needs it. 0 means not read yet.
+	now int64
+}
+
+// maxPooledKeyBytes bounds the key buffer that an activityBatch keeps in the
+// pool, so that one batch with many long keys does not pin memory.
+const maxPooledKeyBytes = 64 << 10
+
+var activityPool = sync.Pool{New: func() any { return new(activityBatch) }}
+
+func getActivityBatch() *activityBatch {
+	act, _ := activityPool.Get().(*activityBatch)
+	return act
+}
+
+func putActivityBatch(act *activityBatch) {
+	if act == nil || cap(act.keys) > maxPooledKeyBytes {
+		return
+	}
+	act.keys = act.keys[:0]
+	act.touches = act.touches[:0]
+	act.now = 0
+	activityPool.Put(act)
 }
 
 // ruleSpec is what the state needs to know about a rule.
@@ -145,6 +224,10 @@ type state struct {
 	maxStateBytes int
 	// bytes is the sum of the size estimates of all entities.
 	bytes int
+	// tracked mirrors the number of entities of each rule. It is written
+	// under the lock and read without it, so that ConsumeLogs skips the
+	// activity lookup of a rule that has no entities without locking.
+	tracked []atomic.Int64
 }
 
 func newState(specs []ruleSpec, maxStateBytes int) *state {
@@ -152,6 +235,7 @@ func newState(specs []ruleSpec, maxStateBytes int) *state {
 		rules:         make([]ruleState, len(specs)),
 		ruleIndex:     make(map[string]int, len(specs)),
 		maxStateBytes: maxStateBytes,
+		tracked:       make([]atomic.Int64, len(specs)),
 	}
 	for i, spec := range specs {
 		s.rules[i] = ruleState{ruleSpec: spec, entities: make(map[string]*storedEntity)}
@@ -167,20 +251,44 @@ func (s *state) apply(o observation) applyResult {
 	return s.applyLocked(&o)
 }
 
-// applyBatch applies observations in order under one lock. When collect is
-// set, it also returns copies of the entities that the batch inserted or
-// changed, each once with its final value.
-func (s *state) applyBatch(obs []observation, collect bool) batchResult {
+// tracking reports whether any rule has entities. It does not lock.
+func (s *state) tracking() bool {
+	for i := range s.tracked {
+		if s.tracked[i].Load() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// ruleTracked reports whether the rule has entities. It does not lock.
+func (s *state) ruleTracked(rule int) bool {
+	return s.tracked[rule].Load() > 0
+}
+
+// applyBatch applies the touches of act, which can be nil, then the
+// observations in order, under one lock. The touches go first, so that an
+// eviction caused by the observations sees the latest activity. When
+// collect is set, it also returns copies of the entities that the batch
+// inserted or changed, each once with its final value.
+func (s *state) applyBatch(obs []observation, act *activityBatch, collect bool) batchResult {
 	var res batchResult
 	var dirty []entityRef
 	var seen map[entityRef]struct{}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if act != nil {
+		res.touched = s.touchLocked(act)
+	}
 	for i := range obs {
 		r := s.applyLocked(&obs[i])
 		res.counts[r.outcome]++
 		res.evicted = append(res.evicted, r.evicted...)
+		res.touched = res.touched || r.touched
+		if r.outcome == outcomeTooLarge && len(r.evicted) == 0 {
+			res.rejected = append(res.rejected, entityRef{rule: obs[i].rule, key: obs[i].key})
+		}
 		if !collect || (r.outcome != outcomeInserted && r.outcome != outcomeChanged) {
 			continue
 		}
@@ -195,10 +303,68 @@ func (s *state) applyBatch(obs []observation, collect bool) batchResult {
 	}
 	for _, ref := range dirty {
 		if e, ok := s.rules[ref.rule].entities[ref.key]; ok {
-			res.changed = append(res.changed, emitEntry{rule: ref.rule, entity: e.entity})
+			res.changed = append(res.changed, emitEntry{rule: ref.rule, key: ref.key, entity: e.entity})
 		}
 	}
 	return res
+}
+
+// touchLocked moves the Activity of each touched entity that exists
+// forward to the touch time. It reports whether any Activity moved. The
+// map index with a converted byte slice does not allocate.
+func (s *state) touchLocked(act *activityBatch) bool {
+	moved := false
+	for i := range act.touches {
+		t := &act.touches[i]
+		e, ok := s.rules[t.rule].entities[string(act.keys[t.from:t.to])]
+		if ok && t.time > e.Activity {
+			e.Activity = t.time
+			moved = true
+		}
+	}
+	return moved
+}
+
+// entries returns copies of the entities of the given rules, sorted by
+// rule index and then by key. The copies share their slices with the
+// state, which never modifies them, so the caller can use them without the
+// lock.
+func (s *state) entries(rules []int) []emitEntry {
+	out := s.copyEntries(rules)
+	slices.SortFunc(out, func(a, b emitEntry) int {
+		return cmp.Or(cmp.Compare(a.rule, b.rule), cmp.Compare(a.key, b.key))
+	})
+	return out
+}
+
+func (s *state) copyEntries(rules []int) []emitEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, ri := range rules {
+		n += len(s.rules[ri].entities)
+	}
+	if n == 0 {
+		return nil
+	}
+	out := make([]emitEntry, 0, n)
+	for _, ri := range rules {
+		for key, e := range s.rules[ri].entities {
+			out = append(out, emitEntry{rule: ri, key: key, entity: e.entity})
+		}
+	}
+	return out
+}
+
+// sizes stores the number of entities of each rule in counts, which has one
+// element per rule, and returns the size estimate of the state.
+func (s *state) sizes(counts []int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.rules {
+		counts[i] = len(s.rules[i].entities)
+	}
+	return s.bytes
 }
 
 func (s *state) applyLocked(o *observation) applyResult {
@@ -215,13 +381,15 @@ func (s *state) applyLocked(o *observation) applyResult {
 		})
 	}
 
+	touched := o.time > cur.Activity
 	cur.Activity = max(cur.Activity, o.time)
 	if o.time < cur.Updated {
-		return applyResult{outcome: outcomeIgnoredOlder}
+		return applyResult{outcome: outcomeIgnoredOlder, touched: touched}
 	}
 	if slices.Equal(cur.Facts, o.facts) && slices.Equal(cur.Resource, o.resource) {
+		touched = touched || o.time > cur.Updated
 		cur.Updated = o.time
-		return applyResult{outcome: outcomeUnchanged}
+		return applyResult{outcome: outcomeUnchanged, touched: touched}
 	}
 
 	next := entity{
@@ -235,8 +403,9 @@ func (s *state) applyLocked(o *observation) applyResult {
 	size := entitySize(o.key, &next)
 	if size > s.maxStateBytes {
 		// Keeping the previous facts would emit values known to be stale.
-		s.removeLocked(entityRef{rule: o.rule, key: o.key})
-		return applyResult{outcome: outcomeTooLarge, evicted: []entityRef{{rule: o.rule, key: o.key}}}
+		ref := entityRef{rule: o.rule, key: o.key}
+		s.removeLocked(ref)
+		return applyResult{outcome: outcomeTooLarge, evicted: []eviction{{entityRef: ref, reason: evictTooLarge}}}
 	}
 	s.bytes += size - cur.size
 	cur.entity, cur.size = next, size
@@ -252,16 +421,17 @@ func (s *state) insertLocked(rule int, key string, e entity) applyResult {
 		return applyResult{outcome: outcomeTooLarge}
 	}
 	rs := &s.rules[rule]
-	var evicted []entityRef
+	var evicted []eviction
 	for len(rs.entities) >= rs.maxEntities {
 		victim, ok := s.leastActiveLocked(rule, rule, "")
 		if !ok {
 			break
 		}
 		s.removeLocked(victim)
-		evicted = append(evicted, victim)
+		evicted = append(evicted, eviction{entityRef: victim, reason: evictMaxEntities})
 	}
 	rs.entities[key] = &storedEntity{entity: e, size: size}
+	s.tracked[rule].Store(int64(len(rs.entities)))
 	s.bytes += size
 	evicted = append(evicted, s.evictForBytesLocked(rule, key)...)
 	return applyResult{outcome: outcomeInserted, evicted: evicted}
@@ -269,15 +439,15 @@ func (s *state) insertLocked(rule int, key string, e entity) applyResult {
 
 // evictForBytesLocked evicts the least active entities of any rule, never
 // the entity (keepRule, keepKey), until the state fits max_state_bytes.
-func (s *state) evictForBytesLocked(keepRule int, keepKey string) []entityRef {
-	var evicted []entityRef
+func (s *state) evictForBytesLocked(keepRule int, keepKey string) []eviction {
+	var evicted []eviction
 	for s.bytes > s.maxStateBytes {
 		victim, ok := s.leastActiveLocked(-1, keepRule, keepKey)
 		if !ok {
 			break
 		}
 		s.removeLocked(victim)
-		evicted = append(evicted, victim)
+		evicted = append(evicted, eviction{entityRef: victim, reason: evictMaxStateBytes})
 	}
 	return evicted
 }
@@ -320,6 +490,7 @@ func (s *state) removeLocked(ref entityRef) {
 	if e, ok := rs.entities[ref.key]; ok {
 		s.bytes -= e.size
 		delete(rs.entities, ref.key)
+		s.tracked[ref.rule].Store(int64(len(rs.entities)))
 	}
 }
 
@@ -405,6 +576,7 @@ func (s *state) restore(snap stateSnapshot) (int, int) {
 	defer s.mu.Unlock()
 	for i := range s.rules {
 		s.rules[i].entities = make(map[string]*storedEntity)
+		s.tracked[i].Store(0)
 	}
 	s.bytes = 0
 	for _, it := range items {

@@ -15,7 +15,6 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
-	"go.uber.org/zap"
 )
 
 // compiledRule is a RuleConfig with its OTTL compiled for the hot path.
@@ -112,6 +111,9 @@ type resourceInfo struct {
 	key      string
 	identity []kv
 	resource []kv
+	// truncated counts the identity and resource values cut to the
+	// maximum length.
+	truncated int
 }
 
 // resolveResource reads the identity and the included resource attributes.
@@ -121,15 +123,16 @@ type resourceInfo struct {
 // computed from the truncated values, so the state and the emitted labels
 // agree.
 func (r *compiledRule) resolveResource(attrs pcommon.Map, maxLen int) resourceInfo {
+	truncated := 0
 	identity := make([]kv, 0, len(r.cfg.Identity))
 	for _, k := range r.cfg.Identity {
 		v, ok := attrs.Get(k)
 		if !ok {
-			return resourceInfo{resolved: true}
+			return resourceInfo{resolved: true, truncated: truncated}
 		}
-		s := truncateUTF8(v.AsString(), maxLen)
+		s := truncateCounted(v.AsString(), maxLen, &truncated)
 		if s == "" {
-			return resourceInfo{resolved: true}
+			return resourceInfo{resolved: true, truncated: truncated}
 		}
 		identity = append(identity, kv{Key: k, Value: strings.Clone(s)})
 	}
@@ -142,48 +145,91 @@ func (r *compiledRule) resolveResource(attrs pcommon.Map, maxLen int) resourceIn
 		if !ok {
 			continue
 		}
-		if s := truncateUTF8(v.AsString(), maxLen); s != "" {
+		if s := truncateCounted(v.AsString(), maxLen, &truncated); s != "" {
 			resource = append(resource, kv{Key: k, Value: strings.Clone(s)})
 		}
 	}
-	return resourceInfo{resolved: true, ok: true, key: encodeIdentity(identity), identity: identity, resource: resource}
+	return resourceInfo{
+		resolved:  true,
+		ok:        true,
+		key:       encodeIdentity(identity),
+		identity:  identity,
+		resource:  resource,
+		truncated: truncated,
+	}
+}
+
+// appendIdentityKey appends the state key of the resource's identity to
+// buf. The key is the one that resolveResource computes, but it is built
+// without allocating when the identity values are strings. It returns
+// false when an identity attribute is missing or empty, and then buf can
+// hold part of a key past its original length.
+func (r *compiledRule) appendIdentityKey(buf []byte, attrs pcommon.Map, maxLen int) ([]byte, bool) {
+	for _, k := range r.cfg.Identity {
+		v, ok := attrs.Get(k)
+		if !ok {
+			return buf, false
+		}
+		s := truncateUTF8(v.AsString(), maxLen)
+		if s == "" {
+			return buf, false
+		}
+		buf = appendKeyPart(buf, s)
+	}
+	return buf, true
+}
+
+// factsResult is the result of extractFacts.
+type factsResult struct {
+	values []kv
+	// missing is the key of the first required attribute without a value.
+	// It is empty when the record yields facts.
+	missing string
+	// missingErr is the evaluation error of that attribute, if any.
+	missingErr error
+	// truncated counts the values cut to the maximum length.
+	truncated int
 }
 
 // extractFacts evaluates the attributes in config order. A value that is an
 // error, nil, or empty (also after truncation) is missing: default_value
-// replaces it, optional omits it, and otherwise the record is not used (the
-// bool is false). The error is non-nil only in propagate mode, when a
-// required fact without a default fails to evaluate.
-func (r *compiledRule) extractFacts(ctx context.Context, tCtx *ottllog.TransformContext, maxLen int, errorMode ottl.ErrorMode, logger *zap.Logger) ([]kv, bool, error) {
-	facts := make([]kv, 0, len(r.attrs))
+// replaces it, optional omits it, and otherwise the record is not used
+// (missing names the attribute). The error is non-nil only in
+// propagate mode, when a required fact without a default fails to
+// evaluate.
+func (r *compiledRule) extractFacts(ctx context.Context, tCtx *ottllog.TransformContext, maxLen int, errorMode ottl.ErrorMode) (factsResult, error) {
+	res := factsResult{values: make([]kv, 0, len(r.attrs))}
 	for i := range r.attrs {
 		attr := &r.attrs[i]
 		raw, err := attr.expr.Eval(ctx, tCtx)
 		var v string
 		if err == nil {
-			v = truncateUTF8(valueString(raw), maxLen)
+			v = truncateCounted(valueString(raw), maxLen, &res.truncated)
 		}
 		switch {
 		case v != "":
-			facts = append(facts, kv{Key: attr.key, Value: strings.Clone(v)})
+			res.values = append(res.values, kv{Key: attr.key, Value: strings.Clone(v)})
 		case attr.defaultValue != "":
 			// Validate ensures that default_value fits max_value_length.
-			facts = append(facts, kv{Key: attr.key, Value: attr.defaultValue})
+			res.values = append(res.values, kv{Key: attr.key, Value: attr.defaultValue})
 		case attr.optional:
 			// Omitted.
 		default:
 			if err != nil && errorMode == ottl.PropagateError {
-				return nil, false, fmt.Errorf("rule %q: failed to evaluate required attribute %q: %w", r.cfg.Name, attr.key, err)
+				return factsResult{truncated: res.truncated}, fmt.Errorf("rule %q: failed to evaluate required attribute %q: %w", r.cfg.Name, attr.key, err)
 			}
-			if errorMode != ottl.SilentError {
-				if ce := logger.Check(zap.DebugLevel, "Matching log record not used: a required attribute has no value"); ce != nil {
-					ce.Write(zap.String("rule", r.cfg.Name), zap.String("attribute", attr.key), zap.Error(err))
-				}
-			}
-			return nil, false, nil
+			return factsResult{missing: attr.key, missingErr: err, truncated: res.truncated}, nil
 		}
 	}
-	return facts, true, nil
+	return res, nil
+}
+
+// appendKeyPart appends one identity value to a state key: its length,
+// a colon, then the value. encodeIdentity uses the same format.
+func appendKeyPart(buf []byte, v string) []byte {
+	buf = strconv.AppendInt(buf, int64(len(v)), 10)
+	buf = append(buf, ':')
+	return append(buf, v...)
 }
 
 // encodeIdentity encodes identity values as a state key. Each value is
@@ -230,6 +276,15 @@ func valueString(v any) string {
 		return fmt.Sprint(v)
 	}
 	return val.AsString()
+}
+
+// truncateCounted is truncateUTF8 that adds 1 to *count when it cuts s.
+func truncateCounted(s string, n int, count *int) string {
+	t := truncateUTF8(s, n)
+	if len(t) < len(s) {
+		*count++
+	}
+	return t
 }
 
 // truncateUTF8 returns s cut to at most n bytes without splitting a UTF-8

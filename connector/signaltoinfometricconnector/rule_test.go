@@ -249,9 +249,98 @@ func TestResolvedValuesDoNotAliasInput(t *testing.T) {
 	require.NoError(t, err)
 	lr := plog.NewLogRecord()
 	lr.Body().SetStr(body)
-	facts, ok, err := rules[0].extractFacts(t.Context(), newTCtx(lr), 256, cfg.ErrorMode, zapNop())
+	f, err := rules[0].extractFacts(t.Context(), newTCtx(lr), 256, cfg.ErrorMode)
 	require.NoError(t, err)
-	require.True(t, ok)
-	require.Equal(t, "9999999999", facts[0].Value)
-	assert.False(t, sameMemory(body, facts[0].Value), "the fact must not point into the body")
+	require.Empty(t, f.missing)
+	require.Equal(t, "9999999999", f.values[0].Value)
+	assert.False(t, sameMemory(body, f.values[0].Value), "the fact must not point into the body")
+}
+
+// TestAppendIdentityKey checks that the allocation-free key of the activity
+// path is the key that resolveResource stores.
+func TestAppendIdentityKey(t *testing.T) {
+	long := strings.Repeat("u", 150)
+	for _, tc := range []struct {
+		name     string
+		identity []string
+		attrs    func(pcommon.Map)
+		maxLen   int
+		wantOK   bool
+	}{
+		{name: "one_key", identity: []string{"k8s.pod.uid"}, attrs: func(m pcommon.Map) { m.PutStr("k8s.pod.uid", "uid-1") }, maxLen: 256, wantOK: true},
+		{name: "two_keys", identity: []string{"k8s.pod.uid", "k8s.container.name"}, attrs: func(m pcommon.Map) {
+			m.PutStr("k8s.pod.uid", "uid-1")
+			m.PutStr("k8s.container.name", "vllm")
+		}, maxLen: 256, wantOK: true},
+		{name: "long_value", identity: []string{"k8s.pod.uid"}, attrs: func(m pcommon.Map) { m.PutStr("k8s.pod.uid", long) }, maxLen: 1024, wantOK: true},
+		{name: "truncated", identity: []string{"k8s.pod.uid"}, attrs: func(m pcommon.Map) { m.PutStr("k8s.pod.uid", "uid-éé") }, maxLen: 5, wantOK: true},
+		{name: "int_value", identity: []string{"id"}, attrs: func(m pcommon.Map) { m.PutInt("id", 42) }, maxLen: 256, wantOK: true},
+		{name: "missing", identity: []string{"k8s.pod.uid", "k8s.container.name"}, attrs: func(m pcommon.Map) { m.PutStr("k8s.pod.uid", "uid-1") }, maxLen: 256},
+		{name: "empty", identity: []string{"k8s.pod.uid"}, attrs: func(m pcommon.Map) { m.PutStr("k8s.pod.uid", "") }, maxLen: 256},
+		{name: "empty_after_truncation", identity: []string{"k8s.pod.uid"}, attrs: func(m pcommon.Map) { m.PutStr("k8s.pod.uid", "é") }, maxLen: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rule := compiledRule{cfg: &RuleConfig{Identity: tc.identity}}
+			attrs := pcommon.NewMap()
+			tc.attrs(attrs)
+			prefix := []byte("previous")
+			got, ok := rule.appendIdentityKey(prefix, attrs, tc.maxLen)
+			res := rule.resolveResource(attrs, tc.maxLen)
+			assert.Equal(t, tc.wantOK, ok)
+			assert.Equal(t, res.ok, ok)
+			if ok {
+				assert.Equal(t, "previous"+res.key, string(got))
+			}
+		})
+	}
+
+	// The key of string values is built without allocating.
+	rule := compiledRule{cfg: &RuleConfig{Identity: []string{"k8s.pod.uid", "k8s.container.name"}}}
+	attrs := pcommon.NewMap()
+	attrs.PutStr("k8s.pod.uid", long)
+	attrs.PutStr("k8s.container.name", "vllm")
+	buf := make([]byte, 0, 512)
+	allocs := testing.AllocsPerRun(10, func() {
+		buf, _ = rule.appendIdentityKey(buf[:0], attrs, 256)
+	})
+	assert.Zero(t, allocs)
+}
+
+func TestTruncationCounts(t *testing.T) {
+	rule := compiledRule{cfg: &RuleConfig{
+		Identity:                  []string{"k8s.pod.uid"},
+		IncludeResourceAttributes: []string{"k8s.pod.name", "k8s.namespace.name"},
+	}}
+	attrs := pcommon.NewMap()
+	attrs.PutStr("k8s.pod.uid", "uid-1")
+	attrs.PutStr("k8s.pod.name", "pod-1")
+	attrs.PutStr("k8s.namespace.name", "ns")
+	assert.Equal(t, 0, rule.resolveResource(attrs, 5).truncated)
+	assert.Equal(t, 2, rule.resolveResource(attrs, 4).truncated)
+	// A missing identity after a cut still counts the cut.
+	attrs.PutStr("k8s.pod.uid", "é")
+	res := rule.resolveResource(attrs, 1)
+	assert.False(t, res.ok)
+	assert.Equal(t, 1, res.truncated)
+
+	cfg := testConfig()
+	cfg.MaxValueLength = 3
+	cfg.Rules[0].Attributes[1].DefaultValue = "d"
+	require.NoError(t, cfg.Validate())
+	rules, err := compileRules(cfg, componenttest.NewNopTelemetrySettings())
+	require.NoError(t, err)
+	lr := plog.NewLogRecord()
+	lr.Body().SetStr("app started version=1.2.3 mode=fast region=eu")
+	f, err := rules[0].extractFacts(t.Context(), newTCtx(lr), cfg.MaxValueLength, cfg.ErrorMode)
+	require.NoError(t, err)
+	assert.Equal(t, []kv{{"version", "1.2"}, {"mode", "fas"}, {"region", "eu"}}, f.values)
+	assert.Equal(t, 2, f.truncated)
+
+	// A required fact without a value names the attribute.
+	lr.Body().SetStr("app started mode=fast")
+	f, err = rules[0].extractFacts(t.Context(), newTCtx(lr), cfg.MaxValueLength, cfg.ErrorMode)
+	require.NoError(t, err)
+	assert.Equal(t, "version", f.missing)
+	assert.ErrorContains(t, f.missingErr, "key not found in map")
+	assert.Nil(t, f.values)
 }

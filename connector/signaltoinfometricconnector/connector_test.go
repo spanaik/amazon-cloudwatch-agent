@@ -165,8 +165,6 @@ func newTCtx(lr plog.LogRecord) *ottllog.TransformContext {
 	return ottllog.NewTransformContextPtr(plog.NewResourceLogs(), plog.NewScopeLogs(), lr)
 }
 
-func zapNop() *zap.Logger { return zap.NewNop() }
-
 // sameMemory reports whether b points into the memory of a.
 func sameMemory(a, b string) bool {
 	if a == "" || b == "" {
@@ -544,7 +542,7 @@ func TestConsumeLogsDownstreamErrorIsSwallowed(t *testing.T) {
 	assert.Equal(t, "downstream unavailable", warnings()[0].ContextMap()["error"])
 	assert.Equal(t, int64(0), warnings()[0].ContextMap()["suppressed_since_last_log"])
 
-	now = now.Add(downstreamErrorLogInterval)
+	now = now.Add(logInterval)
 	assert.NoError(t, conn.ConsumeLogs(t.Context(), podLogs("u9", base, "app started version=1")))
 	require.Len(t, warnings(), 2)
 	assert.Equal(t, int64(2), warnings()[1].ContextMap()["suppressed_since_last_log"])
