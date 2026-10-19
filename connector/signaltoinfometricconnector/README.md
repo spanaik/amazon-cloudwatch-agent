@@ -2,8 +2,8 @@
 
 The Signal to Info Metric connector makes Info metrics from facts in log records. It matches log records with
 rules. It extracts facts with [OTTL] value expressions. It keeps the latest facts for each entity, for example for
-each pod UID. An Info metric is a gauge with the value `1`. Its data point attributes carry the facts. When the
-facts change, the connector emits the metric. It also emits the metric at each `emit_interval`. A storage
+each container of a pod. An Info metric is a gauge with the value `1`. Its data point attributes carry the facts.
+When the facts change, the connector emits the metric. It also emits the metric at each `emit_interval`. A storage
 extension can persist the state, so that the facts stay available after an agent restart.
 
 The first use case is the vLLM engine startup line. vLLM writes this line one time for each engine start. The
@@ -89,6 +89,12 @@ An index into a converter result with a missing key gives an evaluation error, n
 The example keeps the state in `file_storage/state` and emits every 30 seconds. Its rule is the rule in
 `testdata/vllm_rule.yaml`, with all 14 facts of the vLLM engine startup line.
 
+The identity of the rule is the namespace, the pod name, and the container name. The kubelet names the log file of
+each container `/var/log/containers/<pod>_<namespace>_<container>-<id>.log`, and the filelog receiver reads the
+three names from the file name. Thus, every record has the identity, also before the k8sattributes processor knows
+the pod. The container name is in the identity, because two containers of one pod can each start an engine. The
+`include_resource_attributes` list has all the identity keys, so the example does not use `identity_output_prefix`.
+
 ```yaml
 extensions:
   file_storage/state:
@@ -98,7 +104,6 @@ connectors:
   signal_to_info_metric/vllm:
     storage: file_storage/state
     emit_interval: 30s
-    identity_output_prefix: cwagent.info.identity.
     rules:
       - name: vllm_engine_config_info
         description: vLLM engine configuration parsed from the engine startup log line. The value is always 1.
@@ -109,8 +114,10 @@ connectors:
           - "Initializing an LLM engine (v"
           - "Initializing a V0 LLM engine (v"
           - "Initializing a V1 LLM engine (v"
-        identity: [k8s.pod.uid]
-        include_resource_attributes: [k8s.pod.name, k8s.namespace.name, k8s.container.name]
+        # The filelog receiver reads these names from the container log file name, so every record has them.
+        # Two containers of one pod are two entities.
+        identity: [k8s.namespace.name, k8s.pod.name, k8s.container.name]
+        include_resource_attributes: [k8s.namespace.name, k8s.pod.name, k8s.container.name]
         attributes:
           - key: vllm_version
             value: 'ExtractPatterns(log.body, "Initializing an? (?:V[01] )?LLM engine \\(v(?P<v>[^)]+)\\) with config: ")["v"]'
@@ -269,8 +276,13 @@ If the record is corrupt or has another version, the connector logs a warning an
 there is no usable record, the connector writes the current state about 1 second after the start. Thus, the
 connector logs the warning only one time. If the read from the storage extension fails, the connector also logs a
 warning and starts with an empty state. It does not replace the record until a change, because the record can
-be valid. If the storage extension does not exist, is not a storage extension, or cannot
-open its storage, the connector does not start.
+be valid.
+
+If the storage extension does not exist or is not a storage extension, the configuration is wrong. The connector
+then returns an error at startup, and the collector does not start. If the storage extension exists but cannot
+give the connector its storage, the connector logs an error and starts without persistence. This happens, for
+example, when `file_storage` cannot open or create its file. The log has the error and the `storage` ID. The
+connector then works as if `storage` is not set. The state is in memory only and does not survive a restart.
 
 The connector fits the restored state to the current configuration:
 
@@ -315,8 +327,8 @@ name.
 | `otelcol_connector_signal_to_info_metric_state_save_rejected` | Counter | none              | State records that the connector did not write, because they are larger than the record limit.     |
 | `otelcol_connector_signal_to_info_metric_state_saved_bytes`   | Gauge   | none              | Size of the state record that the connector last read or wrote, in bytes.                          |
 
-If `storage` is not set, the `state_saves`, `state_save_errors`, `state_save_rejected`, and `state_saved_bytes`
-metrics do not exist.
+If `storage` is not set, or if the connector cannot open the storage at startup, the `state_saves`,
+`state_save_errors`, `state_save_rejected`, and `state_saved_bytes` metrics do not exist.
 
 The `reason` values of `records_not_used`:
 
@@ -349,7 +361,8 @@ evicted entity.
 - Warn: the next consumer returned an error.
 
 If `storage` is set, the connector also logs a failed write of the state at the Error level. It logs a record
-that is too large at the Warn level. Each of the two logs comes at most one time each minute.
+that is too large at the Warn level. Each of the two logs comes at most one time each minute. If the connector
+cannot open the storage at startup, it logs this one time at the Error level. Refer to [Persistence](#persistence).
 
 The other logs of the connector about single records and batches are at the Debug level. With
 `error_mode: ignore`, OTTL logs each evaluation error of a condition at the Warn level, with no rate limit.

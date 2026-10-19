@@ -32,13 +32,15 @@ func countHooks(conn *infoMetricConnector) *hookCounts {
 // activityOf returns the Activity of the app_info entity of a pod.
 func activityOf(t *testing.T, conn *infoMetricConnector, uid string) time.Time {
 	t.Helper()
-	return ruleActivityOf(t, conn, "app_info", uid)
+	return ruleActivityOf(t, conn, "app_info", key(uid))
 }
 
-func ruleActivityOf(t *testing.T, conn *infoMetricConnector, rule, uid string) time.Time {
+// ruleActivityOf returns the Activity of the entity of a rule with the
+// state key k.
+func ruleActivityOf(t *testing.T, conn *infoMetricConnector, rule, k string) time.Time {
 	t.Helper()
-	e, ok := conn.state.snapshot().Rules[rule][key(uid)]
-	require.True(t, ok, uid)
+	e, ok := conn.state.snapshot().Rules[rule][k]
+	require.True(t, ok, k)
 	return time.Unix(0, e.Activity).UTC()
 }
 
@@ -213,5 +215,5 @@ func TestConsumeLogsTrackedActivityDoesNotAllocate(t *testing.T) {
 		_ = conn.ConsumeLogs(context.Background(), ld)
 	})
 	assert.Zero(t, allocs)
-	assert.Equal(t, base.Add(49*time.Millisecond), ruleActivityOf(t, conn, "vllm_engine_config_info", "u07"))
+	assert.Equal(t, base.Add(49*time.Millisecond), ruleActivityOf(t, conn, "vllm_engine_config_info", vllmKey("vllm-07")))
 }

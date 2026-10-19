@@ -67,13 +67,12 @@ func TestLoadConfig(t *testing.T) {
 		{
 			name: "vllm",
 			want: &Config{
-				Storage:              &storageID,
-				EmitInterval:         30 * time.Second,
-				EmitOnChange:         true,
-				MaxStateBytes:        defaultMaxStateBytes,
-				MaxValueLength:       defaultMaxValueLength,
-				ErrorMode:            ottl.IgnoreError,
-				IdentityOutputPrefix: "cwagent.info.identity.",
+				Storage:        &storageID,
+				EmitInterval:   30 * time.Second,
+				EmitOnChange:   true,
+				MaxStateBytes:  defaultMaxStateBytes,
+				MaxValueLength: defaultMaxValueLength,
+				ErrorMode:      ottl.IgnoreError,
 				Rules: []RuleConfig{{
 					Name:        "vllm_engine_config_info",
 					Description: "vLLM engine configuration from the engine startup log line.",
@@ -82,8 +81,8 @@ func TestLoadConfig(t *testing.T) {
 						"Initializing a V0 LLM engine (v",
 						"Initializing a V1 LLM engine (v",
 					},
-					Identity:                  []string{"k8s.pod.uid"},
-					IncludeResourceAttributes: []string{"k8s.pod.name", "k8s.namespace.name", "k8s.container.name"},
+					Identity:                  []string{"k8s.namespace.name", "k8s.pod.name", "k8s.container.name"},
+					IncludeResourceAttributes: []string{"k8s.namespace.name", "k8s.pod.name", "k8s.container.name"},
 					Attributes: []AttributeConfig{
 						{Key: "vllm_version", Value: `ExtractPatterns(log.body, "Initializing an? (?:V[01] )?LLM engine \\(v(?P<v>[^)]+)\\) with config: ")["v"]`},
 						{Key: "vllm_engine", Value: `ExtractPatterns(log.body, "Initializing a (?P<v>V[01]) LLM engine")["v"]`, DefaultValue: "V0"},

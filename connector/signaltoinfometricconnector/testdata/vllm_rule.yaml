@@ -5,7 +5,6 @@
 #
 # The vLLM engine configuration rule with the expressions that the Helm chart renders, with all 14 facts.
 # The connector settings are at the top level (no component ID). The example in README.md has the same rule.
-identity_output_prefix: cwagent.info.identity.
 rules:
   - name: vllm_engine_config_info
     description: vLLM engine configuration parsed from the engine startup log line. The value is always 1.
@@ -16,8 +15,10 @@ rules:
       - "Initializing an LLM engine (v"
       - "Initializing a V0 LLM engine (v"
       - "Initializing a V1 LLM engine (v"
-    identity: [k8s.pod.uid]
-    include_resource_attributes: [k8s.pod.name, k8s.namespace.name, k8s.container.name]
+    # The filelog receiver reads these names from the container log file name, so every record has them.
+    # Two containers of one pod are two entities.
+    identity: [k8s.namespace.name, k8s.pod.name, k8s.container.name]
+    include_resource_attributes: [k8s.namespace.name, k8s.pod.name, k8s.container.name]
     attributes:
       - key: vllm_version
         value: 'ExtractPatterns(log.body, "Initializing an? (?:V[01] )?LLM engine \\(v(?P<v>[^)]+)\\) with config: ")["v"]'

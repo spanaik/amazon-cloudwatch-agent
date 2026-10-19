@@ -48,14 +48,26 @@ func maxRecordBytes(cfg *Config) int {
 
 // startPersistence opens the state store, restores the stored state, and
 // starts the saver. It returns an error when the storage extension is
-// missing, is not a storage extension, or cannot give a client (for
-// example, file_storage cannot open its file): the configuration does not
-// work. A failure to read the record is not an error: the connector logs it
-// and starts with an empty state.
+// missing or is not a storage extension, because then the configuration is
+// wrong.
+//
+// If the extension cannot give a client (for example, file_storage cannot
+// open or create its file), or the store cannot be created, the connector
+// logs one Error and keeps the state in memory only. c.store stays nil, the
+// hooks stay no-ops, and there is no store telemetry, as without storage.
+// Persistence is optional, so a node with an unusable storage directory
+// keeps its telemetry.
+//
+// A failure to read the record is not an error either. The connector logs
+// it and starts with an empty state.
 func (c *infoMetricConnector) startPersistence(ctx context.Context, host component.Host) error {
 	client, err := statestore.GetClient(ctx, host, c.cfg.Storage, component.KindConnector, c.id)
-	if err != nil {
+	if errors.Is(err, statestore.ErrExtensionNotFound) || errors.Is(err, statestore.ErrNotStorageExtension) {
 		return fmt.Errorf("failed to get the storage client: %w", err)
+	}
+	if err != nil {
+		c.logStorageUnavailable(err)
+		return nil
 	}
 	store, err := statestore.New[stateSnapshot](client, statestore.Options{
 		Key:      stateRecordKey,
@@ -64,7 +76,14 @@ func (c *infoMetricConnector) startPersistence(ctx context.Context, host compone
 		Logger:   c.logger,
 	})
 	if err != nil {
-		return errors.Join(fmt.Errorf("failed to create the state store: %w", err), client.Close(ctx))
+		err = fmt.Errorf("failed to create the state store: %w", err)
+		// An extension can return a nil client without an error, and New
+		// refuses it.
+		if client != nil {
+			err = errors.Join(err, client.Close(ctx))
+		}
+		c.logStorageUnavailable(err)
+		return nil
 	}
 	if err := c.tel.registerStore(store.Stats); err != nil {
 		// The store owns the client, and Shutdown without Start closes it.
@@ -81,6 +100,15 @@ func (c *infoMetricConnector) startPersistence(ctx context.Context, host compone
 		store.MarkChanged()
 	}
 	return nil
+}
+
+// logStorageUnavailable logs that the connector runs without persistence.
+// Start calls it at most once.
+func (c *infoMetricConnector) logStorageUnavailable(err error) {
+	c.logger.Error("Failed to open the Info metric state storage. The state is kept in memory only and does not survive a restart.",
+		zap.Error(err),
+		zap.String("storage", c.cfg.Storage.String()),
+	)
 }
 
 // restoreState loads the stored record, fits it to the current

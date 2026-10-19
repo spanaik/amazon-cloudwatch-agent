@@ -7,14 +7,14 @@
 # V0 comes from default_value. The startup lines of vllm-v063-1b7c and vllm-v085-9e2a have
 # no data_parallel_size, so their series omit it.
 #
-# The resource holds include_resource_attributes, then the identity with
-# identity_output_prefix; the test sets k8s.pod.uid to "uid-<pod>". start_timestamp is the
-# CRI timestamp of the startup line.
+# The resource holds include_resource_attributes in config order, which are also the identity.
+# The test sets k8s.pod.uid to "uid-<pod>" on the input resource. The rule does not use it, so
+# the resource of a series has no pod UID. start_timestamp is the CRI timestamp of the startup
+# line.
 - resource:
-    k8s.pod.name: vllm-main-7d9f
     k8s.namespace.name: inference
+    k8s.pod.name: vllm-main-7d9f
     k8s.container.name: vllm
-    cwagent.info.identity.k8s.pod.uid: uid-vllm-main-7d9f
   start_timestamp: "2026-10-15T12:40:01.123456789Z"
   attributes:
     vllm_version: 0.31.1
@@ -32,10 +32,9 @@
     enable_prefix_caching: True
     speculative_method: None
 - resource:
-    k8s.pod.name: vllm-v0285-5c4b
     k8s.namespace.name: inference
+    k8s.pod.name: vllm-v0285-5c4b
     k8s.container.name: kserve-container
-    cwagent.info.identity.k8s.pod.uid: uid-vllm-v0285-5c4b
   start_timestamp: "2026-10-15T12:41:00.123456789Z"
   attributes:
     vllm_version: 0.28.0
@@ -53,10 +52,9 @@
     enable_prefix_caching: True
     speculative_method: mtp
 - resource:
-    k8s.pod.name: vllm-v0290-6a1e
     k8s.namespace.name: team-b
+    k8s.pod.name: vllm-v0290-6a1e
     k8s.container.name: vllm
-    cwagent.info.identity.k8s.pod.uid: uid-vllm-v0290-6a1e
   start_timestamp: "2026-10-15T12:42:00.123456789Z"
   attributes:
     vllm_version: 0.29.0
@@ -74,10 +72,9 @@
     enable_prefix_caching: True
     speculative_method: mtp
 - resource:
-    k8s.pod.name: vllm-v063-1b7c
     k8s.namespace.name: legacy
+    k8s.pod.name: vllm-v063-1b7c
     k8s.container.name: server
-    cwagent.info.identity.k8s.pod.uid: uid-vllm-v063-1b7c
   start_timestamp: "2026-10-15T12:44:00.123456789Z"
   attributes:
     vllm_version: 0.6.3
@@ -94,10 +91,9 @@
     enable_prefix_caching: False
     speculative_method: None
 - resource:
-    k8s.pod.name: vllm-v085-9e2a
     k8s.namespace.name: legacy
+    k8s.pod.name: vllm-v085-9e2a
     k8s.container.name: vllm
-    cwagent.info.identity.k8s.pod.uid: uid-vllm-v085-9e2a
   start_timestamp: "2026-10-15T12:43:00.123456789Z"
   attributes:
     vllm_version: 0.8.5

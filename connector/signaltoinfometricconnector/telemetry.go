@@ -101,7 +101,7 @@ type telemetry struct {
 	meter        otelmetric.Meter
 	registration otelmetric.Registration
 	// storeRegistration is the callback of the state store instruments. It
-	// is set by registerStore, only when storage is configured.
+	// is set by registerStore, only when the state store opens.
 	storeRegistration otelmetric.Registration
 	unregister        sync.Once
 }
@@ -178,7 +178,7 @@ func addOptions(attrs ...attribute.KeyValue) []otelmetric.AddOption {
 
 // registerStore creates the instruments of the state store and registers
 // their callback, which reads stats. The connector calls it in Start, only
-// when storage is configured.
+// when storage is configured and the state store opens.
 func (t *telemetry) registerStore(stats func() statestore.Stats) error {
 	var errs error
 	newCounter := func(name, desc, unit string) otelmetric.Int64ObservableCounter {

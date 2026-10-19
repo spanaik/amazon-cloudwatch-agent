@@ -41,7 +41,7 @@ func loadVLLMRuleFile(t testing.TB) *Config {
 // change a pattern.
 func TestVLLMRuleFile(t *testing.T) {
 	cfg := loadVLLMRuleFile(t)
-	assert.Equal(t, "cwagent.info.identity.", cfg.IdentityOutputPrefix)
+	assert.Empty(t, cfg.IdentityOutputPrefix, "the identity is in include_resource_attributes")
 	require.Len(t, cfg.Rules, 1)
 	rule := cfg.Rules[0]
 	assert.Equal(t, "vllm_engine_config_info", rule.Name)
@@ -49,8 +49,8 @@ func TestVLLMRuleFile(t *testing.T) {
 	assert.Equal(t, 500, rule.MaxEntities)
 	assert.Equal(t, []string{"Initializing an LLM engine (v", "Initializing a V0 LLM engine (v", "Initializing a V1 LLM engine (v"}, rule.BodyContains)
 	assert.Empty(t, rule.Conditions)
-	assert.Equal(t, []string{"k8s.pod.uid"}, rule.Identity)
-	assert.Equal(t, []string{"k8s.pod.name", "k8s.namespace.name", "k8s.container.name"}, rule.IncludeResourceAttributes)
+	assert.Equal(t, []string{"k8s.namespace.name", "k8s.pod.name", "k8s.container.name"}, rule.Identity)
+	assert.Equal(t, []string{"k8s.namespace.name", "k8s.pod.name", "k8s.container.name"}, rule.IncludeResourceAttributes)
 
 	extract := func(pattern string) string {
 		return `ExtractPatterns(log.body, "` + pattern + `")["v"]`
@@ -154,8 +154,9 @@ func parseCRI(t testing.TB, line string) criLine {
 	return criLine{ts: ts, body: parts[3]}
 }
 
-// resource returns the resource attributes of a fixture's pod, with a
-// synthetic pod UID.
+// resource returns the resource attributes of a fixture's container: the
+// names in the log file name, and a synthetic pod UID, which the vLLM rule
+// does not use.
 func (f *fixture) resource() map[string]string {
 	return map[string]string{
 		"k8s.pod.name":       f.pod,
@@ -163,6 +164,25 @@ func (f *fixture) resource() map[string]string {
 		"k8s.container.name": f.container,
 		"k8s.pod.uid":        "uid-" + f.pod,
 	}
+}
+
+// vllmPodResource returns the resource attributes of a record of the vllm
+// container of a pod in the inference namespace: the names that the filelog
+// receiver reads from the log file name, and the pod UID that k8sattributes
+// adds.
+func vllmPodResource(pod string) map[string]string {
+	return map[string]string{
+		"k8s.namespace.name": "inference",
+		"k8s.pod.name":       pod,
+		"k8s.container.name": "vllm",
+		"k8s.pod.uid":        "uid-" + pod,
+	}
+}
+
+// vllmKey returns the state key of the vllm container of a pod in the
+// inference namespace.
+func vllmKey(pod string) string {
+	return encodeIdentity([]kv{{"k8s.namespace.name", "inference"}, {"k8s.pod.name", pod}, {"k8s.container.name", "vllm"}})
 }
 
 // fixtureLogs returns all fixtures as one batch, one ResourceLogs per file.
@@ -231,9 +251,14 @@ func toGolden(t *testing.T, got []series) []goldenSeries {
 		})
 	}
 	slices.SortFunc(out, func(a, b goldenSeries) int {
-		return strings.Compare(a.Resource[0].Value, b.Resource[0].Value)
+		return strings.Compare(goldenPod(a), goldenPod(b))
 	})
 	return out
+}
+
+// goldenPod returns the pod name of a series.
+func goldenPod(s goldenSeries) string {
+	return pairValue(s.Resource, "k8s.pod.name")
 }
 
 // assertGolden compares series one pod at a time, for readable diffs.
@@ -241,7 +266,7 @@ func assertGolden(t *testing.T, want, got []goldenSeries) {
 	t.Helper()
 	require.Len(t, got, len(want))
 	for i := range want {
-		assert.Equal(t, want[i], got[i], "series %d (%s)", i, want[i].Resource[0].Value)
+		assert.Equal(t, want[i], got[i], "series %d (%s)", i, goldenPod(want[i]))
 	}
 }
 
@@ -305,12 +330,95 @@ func TestVLLMNonStartupLines(t *testing.T) {
 		// No model: model is required.
 		"Initializing a V1 LLM engine (v0.11.0) with config: speculative_config=None, seed=0",
 	)
+	logs := func(body string) plog.Logs {
+		ld := plog.NewLogs()
+		addRecord(addResource(ld, vllmPodResource("vllm-0")), base, body)
+		return ld
+	}
 	for _, body := range lines {
 		sink := new(consumertest.MetricsSink)
 		conn, _ := newTestConnector(t, loadVLLMRuleFile(t), sink)
-		require.NoError(t, conn.ConsumeLogs(t.Context(), podLogs("u1", base, body)))
+		require.NoError(t, conn.ConsumeLogs(t.Context(), logs(body)))
 		assert.Empty(t, sink.AllMetrics(), body)
 		assert.Empty(t, conn.state.snapshot().Rules, body)
+	}
+
+	// The same resource with a startup line gives a series.
+	sink := new(consumertest.MetricsSink)
+	conn, _ := newTestConnector(t, loadVLLMRuleFile(t), sink)
+	require.NoError(t, conn.ConsumeLogs(t.Context(), logs(vllmStartupLine)))
+	assert.Len(t, allSeries(t, sink.AllMetrics()), 1)
+}
+
+// TestVLLMTwoContainersInOnePod checks that two containers of one pod that
+// both log a startup line give two series. This is why the container name
+// is in the identity. With only the namespace and the pod name, the newer
+// startup line replaces the facts of the other container. The records give
+// the same series with and without the pod UID, which k8sattributes adds
+// only when it knows the pod.
+func TestVLLMTwoContainersInOnePod(t *testing.T) {
+	const (
+		prefill = "INFO 10-15 12:00:00 [core.py:77] Initializing a V1 LLM engine (v0.11.0) with config: model='m', served_model_name=prefill, tensor_parallel_size=2, seed=0"
+		decode  = "INFO 10-15 12:00:01 [core.py:77] Initializing a V1 LLM engine (v0.11.0) with config: model='m', served_model_name=decode, tensor_parallel_size=4, seed=0"
+	)
+	resource := func(container string) []kv {
+		return []kv{{"k8s.namespace.name", "inference"}, {"k8s.pod.name", "vllm-pd-0"}, {"k8s.container.name", container}}
+	}
+	facts := func(name, tp string) []kv {
+		return []kv{{"vllm_version", "0.11.0"}, {"model", "m"}, {"vllm_engine", "V1"}, {"served_model_name", name}, {"tensor_parallel_size", tp}}
+	}
+	for _, tc := range []struct {
+		name     string
+		identity []string
+		podUID   bool
+		want     [][2][]kv
+	}{
+		{
+			name:   "with_pod_uid",
+			podUID: true,
+			want:   [][2][]kv{{resource("decode"), facts("decode", "4")}, {resource("prefill"), facts("prefill", "2")}},
+		},
+		{
+			name: "without_pod_uid",
+			want: [][2][]kv{{resource("decode"), facts("decode", "4")}, {resource("prefill"), facts("prefill", "2")}},
+		},
+		{
+			name:     "without_container_in_identity",
+			identity: []string{"k8s.namespace.name", "k8s.pod.name"},
+			podUID:   true,
+			want:     [][2][]kv{{resource("decode"), facts("decode", "4")}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := loadVLLMRuleFile(t)
+			if tc.identity != nil {
+				cfg.Rules[0].Identity = tc.identity
+			}
+			sink := new(consumertest.MetricsSink)
+			conn, _ := newTestConnector(t, cfg, sink)
+			ld := plog.NewLogs()
+			for i, c := range []struct{ container, body string }{{"prefill", prefill}, {"decode", decode}} {
+				attrs := map[string]string{}
+				for _, p := range resource(c.container) {
+					attrs[p.Key] = p.Value
+				}
+				if tc.podUID {
+					attrs["k8s.pod.uid"] = "uid-vllm-pd-0"
+				}
+				addRecord(addResource(ld, attrs), base.Add(time.Duration(i)*time.Second), c.body)
+			}
+			require.NoError(t, conn.ConsumeLogs(t.Context(), ld))
+
+			var got [][2][]kv
+			for _, s := range allSeries(t, sink.AllMetrics()) {
+				got = append(got, [2][]kv{s.resource, s.attrs})
+			}
+			slices.SortFunc(got, func(a, b [2][]kv) int {
+				return strings.Compare(pairValue(a[0], "k8s.container.name"), pairValue(b[0], "k8s.container.name"))
+			})
+			assert.Equal(t, tc.want, got)
+			assert.Len(t, conn.state.snapshot().Rules["vllm_engine_config_info"], len(tc.want))
+		})
 	}
 }
 
@@ -332,7 +440,7 @@ var noMatchBodies = []string{
 // noMatchLogs returns n non-matching records for one pod.
 func noMatchLogs(n int) plog.Logs {
 	ld := plog.NewLogs()
-	lrs := addResource(ld, podResource("u1"))
+	lrs := addResource(ld, vllmPodResource("vllm-0"))
 	for i := range n {
 		addRecord(lrs, base.Add(time.Duration(i)*time.Millisecond), noMatchBodies[i%len(noMatchBodies)])
 	}
@@ -364,11 +472,11 @@ func BenchmarkConsumeLogsNoMatch(b *testing.B) {
 const vllmStartupLine = "INFO 10-15 12:00:00 [core.py:77] Initializing a V1 LLM engine (v0.11.0) with config: model='m', tensor_parallel_size=1, seed=0"
 
 // trackedActivityLogs returns pods ResourceLogs with perPod non-matching
-// records each. The pods are u00, u01, and so on.
+// records each. The pods are vllm-00, vllm-01, and so on.
 func trackedActivityLogs(pods, perPod int) plog.Logs {
 	ld := plog.NewLogs()
 	for p := range pods {
-		lrs := addResource(ld, podResource(fmt.Sprintf("u%02d", p)))
+		lrs := addResource(ld, vllmPodResource(fmt.Sprintf("vllm-%02d", p)))
 		for i := range perPod {
 			addRecord(lrs, base.Add(time.Duration(i)*time.Millisecond), noMatchBodies[(p+i)%len(noMatchBodies)])
 		}
@@ -377,14 +485,14 @@ func trackedActivityLogs(pods, perPod int) plog.Logs {
 }
 
 // newTrackedConnector returns a connector with the vLLM rule that tracks
-// pods u00 to u<pods-1>, inserted an hour before base.
+// pods vllm-00 to vllm-<pods-1>, inserted an hour before base.
 func newTrackedConnector(tb testing.TB, pods int) *infoMetricConnector {
 	tb.Helper()
 	conn, err := newConnector(connectortest.NewNopSettings(component.MustNewType(TypeStr)), loadVLLMRuleFile(tb), consumertest.NewNop())
 	require.NoError(tb, err)
 	ld := plog.NewLogs()
 	for p := range pods {
-		addRecord(addResource(ld, podResource(fmt.Sprintf("u%02d", p))), base.Add(-time.Hour), vllmStartupLine)
+		addRecord(addResource(ld, vllmPodResource(fmt.Sprintf("vllm-%02d", p))), base.Add(-time.Hour), vllmStartupLine)
 	}
 	require.NoError(tb, conn.ConsumeLogs(context.Background(), ld))
 	require.Len(tb, conn.state.snapshot().Rules["vllm_engine_config_info"], pods)

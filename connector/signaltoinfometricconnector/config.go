@@ -63,7 +63,8 @@ const (
 // point attributes carry the facts) per rule and entity.
 type Config struct {
 	// Storage is the ID of a storage extension used to persist state across
-	// restarts. When nil, state is kept in memory only.
+	// restarts. When nil, state is kept in memory only. It is also kept in
+	// memory only when the extension cannot give a storage client at Start.
 	Storage *component.ID `mapstructure:"storage"`
 	// EmitInterval is how often the current Info metrics are re-emitted.
 	// Rules can override it.

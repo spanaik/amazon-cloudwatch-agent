@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -587,23 +588,126 @@ func TestPersistGetError(t *testing.T) {
 	})
 }
 
+// TestPersistStartErrors checks that a storage ID that does not name a
+// storage extension fails Start. This is a configuration error.
 func TestPersistStartErrors(t *testing.T) {
 	nopFactory := extensiontest.NewNopFactory()
 	nop, err := nopFactory.Create(context.Background(), extensiontest.NewNopSettings(nopFactory.Type()), nopFactory.CreateDefaultConfig())
 	require.NoError(t, err)
 	for name, tc := range map[string]struct {
-		host component.Host
-		want string
+		host     component.Host
+		sentinel error
+		want     string
 	}{
-		"missing_extension": {host: componenttest.NewNopHost(), want: `storage extension "file_storage/state" is not configured`},
-		"not_storage":       {host: testHost{testStorageID: nop}, want: `extension "file_storage/state" is not a storage extension`},
+		"missing_extension": {
+			host:     componenttest.NewNopHost(),
+			sentinel: statestore.ErrExtensionNotFound,
+			want:     `failed to get the storage client: statestore: storage extension not found: "file_storage/state"`,
+		},
+		"not_storage": {
+			host:     testHost{testStorageID: nop},
+			sentinel: statestore.ErrNotStorageExtension,
+			want:     `failed to get the storage client: statestore: extension is not a storage extension: "file_storage/state"`,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			conn, _ := newStorageConnector(t, testConfig(), consumertest.NewNop())
+			conn, logs := newStorageConnector(t, testConfig(), consumertest.NewNop())
 			err := conn.Start(context.Background(), tc.host)
-			assert.ErrorContains(t, err, tc.want)
+			assert.EqualError(t, err, tc.want)
+			assert.ErrorIs(t, err, tc.sentinel)
 			assert.Nil(t, conn.store)
+			assert.Zero(t, logs.FilterLevelExact(zapcore.ErrorLevel).Len(), "the error goes to the collector, not to the log")
 			require.NoError(t, conn.Shutdown(context.Background()))
+		})
+	}
+}
+
+// brokenStorage is a storage extension whose GetClient returns client and
+// err, as file_storage does when it cannot open or create its file.
+type brokenStorage struct {
+	component.StartFunc
+	component.ShutdownFunc
+	client storage.Client
+	err    error
+}
+
+var _ storage.Extension = (*brokenStorage)(nil)
+
+func (b *brokenStorage) GetClient(context.Context, component.Kind, component.ID, string) (storage.Client, error) {
+	return b.client, b.err
+}
+
+// TestPersistStorageUnavailable checks that a storage extension that exists
+// but gives no usable client does not stop the connector. Start logs one
+// Error, and the connector works as without storage: it consumes logs and
+// emits, has no store and no store telemetry, and shuts down cleanly.
+func TestPersistStorageUnavailable(t *testing.T) {
+	const msg = "Failed to open the Info metric state storage. The state is kept in memory only and does not survive a restart."
+	for _, tc := range []struct {
+		name string
+		ext  func(t *testing.T) component.Component
+		// wantErr is a substring of the error field of the log.
+		wantErr string
+	}{
+		{
+			name: "get_client_error",
+			ext: func(*testing.T) component.Component {
+				return &brokenStorage{err: errors.New("open /var/lib/amazon-cloudwatch-agent/state/connector_signaltoinfometric_vllm: permission denied")}
+			},
+			wantErr: `statestore: storage extension "file_storage/state" cannot give a client: open /var/lib/amazon-cloudwatch-agent/state/connector_signaltoinfometric_vllm: permission denied`,
+		},
+		{
+			// statestore.New refuses the nil client.
+			name:    "nil_client",
+			ext:     func(*testing.T) component.Component { return &brokenStorage{} },
+			wantErr: "failed to create the state store: statestore: client is required",
+		},
+		{
+			// A real file_storage extension whose directory is gone after
+			// its start.
+			name: "file_storage_cannot_open",
+			ext: func(t *testing.T) component.Component {
+				dir := t.TempDir()
+				ext := startFileStorage(t, dir)
+				t.Cleanup(func() { assert.NoError(t, ext.Shutdown(context.Background())) })
+				require.NoError(t, os.RemoveAll(dir))
+				return ext
+			},
+			wantErr: "no such file or directory",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := testConfig()
+			cfg.Storage = &testStorageID
+			sink := new(consumertest.MetricsSink)
+			conn, tel, logs := newTelemetryConnector(t, cfg, sink)
+			conn.id = testConnectorID
+
+			require.NoError(t, conn.Start(ctx, testHost{testStorageID: tc.ext(t)}))
+			entries := logs.FilterMessage(msg).All()
+			require.Len(t, entries, 1)
+			assert.Equal(t, zapcore.ErrorLevel, entries[0].Level)
+			fields := entries[0].ContextMap()
+			assert.Equal(t, testStorageID.String(), fields["storage"])
+			assert.Contains(t, fields["error"], tc.wantErr)
+			assert.Equal(t, 1, logs.FilterLevelExact(zapcore.ErrorLevel).Len(), "no other Error")
+			assert.Nil(t, conn.store)
+
+			require.NoError(t, conn.ConsumeLogs(ctx, podLogs("u1", base, "app started version=1")))
+			got := allSeries(t, sink.AllMetrics())
+			require.Len(t, got, 1, "emit on change")
+			assert.Equal(t, []kv{{"k8s.pod.name", "pod-u1"}, {"id.k8s.pod.uid", "u1"}}, got[0].resource)
+			assert.Equal(t, []kv{{"version", "1"}, {"mode", "default"}}, got[0].attrs)
+
+			metrics := collect(t, tel)
+			assert.Equal(t, map[string]int64{"rule=app_info": 1}, metrics[metricEntities])
+			for _, name := range []string{metricStateSaves, metricStateSaveErrors, metricStateSaveRejected, metricStateSavedBytes} {
+				assert.NotContains(t, metrics, name, "no store telemetry")
+			}
+
+			require.NoError(t, conn.Shutdown(ctx))
+			assert.Equal(t, 1, logs.FilterMessage(msg).Len(), "logged once")
 		})
 	}
 }
@@ -776,8 +880,9 @@ func TestPersistShutdown(t *testing.T) {
 }
 
 // vllmPodLogs returns one ResourceLogs per pod, pods from to to-1, each with
-// one vLLM startup line of the fixtures. The pod UIDs, names, and the facts
-// have realistic lengths.
+// one vLLM startup line of the fixtures. The pod names and the facts have
+// realistic lengths. The pod UID is on the resource, but the vLLM rule does
+// not keep it.
 func vllmPodLogs(bodies []string, from, to int) plog.Logs {
 	ld := plog.NewLogs()
 	for i := from; i < to; i++ {

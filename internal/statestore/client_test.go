@@ -5,6 +5,8 @@ package statestore
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -25,32 +27,47 @@ func (h testHost) GetExtensions() map[component.ID]component.Component {
 	return h
 }
 
-// recordingStorage is a storage.Extension that records what GetClient was asked for.
+// recordingStorage is a storage.Extension that records what GetClient was asked for. If err is set,
+// GetClient returns it and no client.
 type recordingStorage struct {
 	component.StartFunc
 	component.ShutdownFunc
 	kind component.Kind
 	id   component.ID
 	name string
+	err  error
 }
 
 func (r *recordingStorage) GetClient(_ context.Context, kind component.Kind, id component.ID, name string) (storage.Client, error) {
 	r.kind, r.id, r.name = kind, id, name
+	if r.err != nil {
+		return nil, r.err
+	}
 	return newFakeClient(), nil
 }
 
 var _ storage.Extension = (*recordingStorage)(nil)
 
+// assertNotConfigError checks that err is not one of the configuration errors of GetClient.
+func assertNotConfigError(t *testing.T, err error) {
+	t.Helper()
+	assert.NotErrorIs(t, err, ErrExtensionNotFound)
+	assert.NotErrorIs(t, err, ErrNotStorageExtension)
+}
+
 func TestGetClientNilID(t *testing.T) {
 	client, err := GetClient(context.Background(), testHost{}, nil, component.KindConnector, component.MustNewID("my_connector"))
 	assert.EqualError(t, err, "statestore: no storage extension ID")
+	assertNotConfigError(t, err)
 	assert.Nil(t, client)
 }
 
 func TestGetClientMissingExtension(t *testing.T) {
 	storageID := component.MustNewIDWithName("file_storage", "missing")
 	client, err := GetClient(context.Background(), testHost{}, &storageID, component.KindConnector, component.MustNewID("my_connector"))
-	assert.EqualError(t, err, `statestore: storage extension "file_storage/missing" is not configured`)
+	assert.EqualError(t, err, `statestore: storage extension not found: "file_storage/missing"`)
+	assert.ErrorIs(t, err, ErrExtensionNotFound)
+	assert.NotErrorIs(t, err, ErrNotStorageExtension)
 	assert.Nil(t, client)
 }
 
@@ -61,8 +78,40 @@ func TestGetClientNonStorageExtension(t *testing.T) {
 	storageID := component.MustNewID("nop")
 
 	client, err := GetClient(context.Background(), testHost{storageID: nop}, &storageID, component.KindConnector, component.MustNewID("my_connector"))
-	assert.EqualError(t, err, `statestore: extension "nop" is not a storage extension`)
+	assert.EqualError(t, err, `statestore: extension is not a storage extension: "nop"`)
+	assert.ErrorIs(t, err, ErrNotStorageExtension)
+	assert.NotErrorIs(t, err, ErrExtensionNotFound)
 	assert.Nil(t, client)
+}
+
+func TestGetClientExtensionError(t *testing.T) {
+	extErr := errors.New("open /var/lib/state/connector_signaltoinfometric_pods: permission denied")
+	ext := &recordingStorage{err: extErr}
+	storageID := component.MustNewID("file_storage")
+
+	client, err := GetClient(context.Background(), testHost{storageID: ext}, &storageID,
+		component.KindConnector, component.MustNewIDWithName("signal_to_info_metric", "pods"))
+	assert.EqualError(t, err, `statestore: storage extension "file_storage" cannot give a client: `+extErr.Error())
+	assert.ErrorIs(t, err, extErr)
+	assertNotConfigError(t, err)
+	assert.Nil(t, client)
+}
+
+// TestGetClientFileStorageCannotOpen removes the directory of a started file_storage extension, so
+// that the extension cannot create the file of the client. This is not a configuration error.
+func TestGetClientFileStorageCannotOpen(t *testing.T) {
+	dir := t.TempDir()
+	ext := startFileStorage(t, dir)
+	require.NoError(t, os.RemoveAll(dir))
+	storageID := component.MustNewID("file_storage")
+
+	client, err := GetClient(context.Background(), testHost{storageID: ext}, &storageID,
+		component.KindConnector, component.MustNewIDWithName("signal_to_info_metric", "pods"))
+	assert.ErrorContains(t, err, `statestore: storage extension "file_storage" cannot give a client: `)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	assertNotConfigError(t, err)
+	assert.Nil(t, client)
+	require.NoError(t, ext.Shutdown(context.Background()))
 }
 
 func TestGetClientPassesKindAndNormalizedID(t *testing.T) {

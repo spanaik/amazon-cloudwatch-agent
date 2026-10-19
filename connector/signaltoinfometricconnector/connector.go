@@ -51,7 +51,7 @@ type infoMetricConnector struct {
 	// hooks are called after ConsumeLogs changed the state.
 	hooks stateHooks
 	// store persists the state. It is set by Start when storage is
-	// configured, and nil otherwise.
+	// configured and opens, and nil otherwise.
 	store *statestore.Store[stateSnapshot]
 
 	downstreamErrLog logLimiter
@@ -115,8 +115,9 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 // Start restores the stored state when storage is configured, then
 // launches the periodic emission and returns. It does not emit: the first
 // tick of each emit group comes after a startup delay, also for restored
-// entities. It returns an error only when the storage extension is missing,
-// is not a storage extension, or cannot give a storage client.
+// entities. It returns an error only when the storage extension is missing
+// or is not a storage extension. If the extension cannot give a storage
+// client, Start logs an Error and the state is in memory only.
 func (c *infoMetricConnector) Start(ctx context.Context, host component.Host) error {
 	c.logger.Debug("Starting signal_to_info_metric connector", zap.Int("rules", len(c.rules)), zap.Int("emit_groups", len(c.groups)))
 	if c.cfg.Storage != nil {
