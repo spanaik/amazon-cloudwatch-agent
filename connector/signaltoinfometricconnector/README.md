@@ -279,12 +279,13 @@ be valid.
 
 If the storage extension does not exist or is not a storage extension, the configuration is wrong. The connector
 then returns an error at startup, and the collector does not start. If the storage extension exists but cannot
-give the connector its storage, the connector logs an error and starts without persistence. This happens, for
-example, when `file_storage` cannot open or create its file. The log has the error and the `storage` ID. The
-connector then works as if `storage` is not set. The state is in memory only and does not survive a restart.
-The connector does not try the storage again during that run. At the next start, if the storage opens again, the
+give the connector its storage, the connector logs an error and starts without persistence. An example is a
+`file_storage` extension that cannot open or create its file. The log has the error and the `storage` ID. The
+connector then works the same as without `storage`. The state is in memory only and does not survive a restart.
+The connector does not try the storage again during that run. If the storage opens again at the next start, the
 connector restores the record from before the failure. The facts that the connector learned during the failure
-are then lost until the next matching record of each entity, for example the next vLLM engine startup line.
+are then lost. The connector emits the restored, older facts until the next matching record of each entity, for
+example the next vLLM engine startup line.
 
 The connector fits the restored state to the current configuration:
 
@@ -329,8 +330,8 @@ name.
 | `otelcol_connector_signal_to_info_metric_state_save_rejected` | Counter | none              | State records that the connector did not write, because they are larger than the record limit.     |
 | `otelcol_connector_signal_to_info_metric_state_saved_bytes`   | Gauge   | none              | Size of the state record that the connector last read or wrote, in bytes.                          |
 
-If `storage` is not set, or if the connector cannot open the storage at startup, the `state_saves`,
-`state_save_errors`, `state_save_rejected`, and `state_saved_bytes` metrics do not exist.
+The `state_saves`, `state_save_errors`, `state_save_rejected`, and `state_saved_bytes` metrics exist only with a
+storage that the connector opened at startup.
 
 The `reason` values of `records_not_used`:
 
