@@ -885,8 +885,7 @@ func TestPersistShutdown(t *testing.T) {
 
 // vllmPodLogs returns one ResourceLogs per pod, pods from to to-1, each with
 // one vLLM startup line of the fixtures. The pod names and the facts have
-// realistic lengths. The pod UID is on the resource, but the vLLM rule does
-// not keep it.
+// realistic lengths. The vLLM rule also keeps the pod UID of the resource.
 func vllmPodLogs(bodies []string, from, to int) plog.Logs {
 	ld := plog.NewLogs()
 	for i := from; i < to; i++ {

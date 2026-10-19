@@ -292,6 +292,8 @@ func TestEvictionLogRateLimit(t *testing.T) {
 		"evicted":                   int64(1),
 		"suppressed_since_last_log": int64(0),
 	}, warnings()[0].ContextMap())
+	assert.Equal(t, "Evicted the least active Info metric entities to stay within the limit. "+
+		"The limit is too small only if the evicted entities were still active.", warnings()[0].Message)
 
 	// Within the minute: max_entities is suppressed, max_state_bytes has
 	// its own limit.

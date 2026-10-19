@@ -351,8 +351,9 @@ func (c *infoMetricConnector) apply(ctx context.Context, b *batch, act *activity
 }
 
 // logEvictions logs an eviction for max_entities or max_state_bytes at
-// Warn, at most once per logInterval for each of the two, because it means
-// that the limits are too small for the node. Other evictions, and the
+// Warn, at most once per logInterval for each of the two. The evicted
+// entities are the least active ones, often of deleted pods, so the limit
+// is too small only if they were still active. Other evictions, and the
 // ones in between, are logged at Debug.
 func (c *infoMetricConnector) logEvictions(res *batchResult) {
 	if len(res.evicted) == 0 && len(res.rejected) == 0 {
@@ -380,7 +381,7 @@ func (c *infoMetricConnector) logEvictions(res *batchResult) {
 		if !ok {
 			continue
 		}
-		c.logger.Warn("Evicted the least active Info metric entities to stay within a state limit. Increase the limit if the node runs more entities.",
+		c.logger.Warn("Evicted the least active Info metric entities to stay within the limit. The limit is too small only if the evicted entities were still active.",
 			zap.String("limit", evictReasonNames[reason]),
 			zap.String("rule", c.rules[firstRule[reason]].cfg.Name),
 			zap.Int64("evicted", n),

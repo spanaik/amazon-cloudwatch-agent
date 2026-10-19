@@ -81,7 +81,7 @@ func TestLoadConfig(t *testing.T) {
 						"Initializing a V1 LLM engine (v",
 					},
 					Identity:                  []string{"k8s.namespace.name", "k8s.pod.name", "k8s.container.name"},
-					IncludeResourceAttributes: []string{"k8s.namespace.name", "k8s.pod.name", "k8s.container.name"},
+					IncludeResourceAttributes: []string{"k8s.namespace.name", "k8s.pod.name", "k8s.container.name", "k8s.pod.uid"},
 					Attributes: []AttributeConfig{
 						{Key: "vllm_version", Value: `ExtractPatterns(log.body, "Initializing an? (?:V[01] )?LLM engine \\(v(?P<v>[^)]+)\\) with config: ")["v"]`},
 						{Key: "vllm_engine", Value: `ExtractPatterns(log.body, "Initializing a (?P<v>V[01]) LLM engine")["v"]`, DefaultValue: "V0"},

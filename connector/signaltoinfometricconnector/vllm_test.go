@@ -49,7 +49,7 @@ func TestVLLMRuleFile(t *testing.T) {
 	assert.Equal(t, []string{"Initializing an LLM engine (v", "Initializing a V0 LLM engine (v", "Initializing a V1 LLM engine (v"}, rule.BodyContains)
 	assert.Empty(t, rule.Conditions)
 	assert.Equal(t, []string{"k8s.namespace.name", "k8s.pod.name", "k8s.container.name"}, rule.Identity)
-	assert.Equal(t, []string{"k8s.namespace.name", "k8s.pod.name", "k8s.container.name"}, rule.IncludeResourceAttributes)
+	assert.Equal(t, []string{"k8s.namespace.name", "k8s.pod.name", "k8s.container.name", "k8s.pod.uid"}, rule.IncludeResourceAttributes)
 
 	extract := func(pattern string) string {
 		return `ExtractPatterns(log.body, "` + pattern + `")["v"]`
@@ -152,8 +152,7 @@ func parseCRI(t testing.TB, line string) criLine {
 }
 
 // resource returns the resource attributes of a fixture's container: the
-// names in the log file name, and a synthetic pod UID, which the vLLM rule
-// does not use.
+// names in the log file name, and a synthetic pod UID.
 func (f *fixture) resource() map[string]string {
 	return map[string]string{
 		"k8s.pod.name":       f.pod,
@@ -350,9 +349,10 @@ func TestVLLMNonStartupLines(t *testing.T) {
 // TestVLLMTwoContainersInOnePod checks that two containers of one pod that
 // both log a startup line give two series. This is why the container name
 // is in the identity. With only the namespace and the pod name, the newer
-// startup line replaces the facts of the other container. The records give
-// the same series with and without the pod UID, which k8sattributes adds
-// only when it knows the pod.
+// startup line replaces the facts of the other container. The pod UID is
+// not in the identity, so the records give two series with and without it.
+// k8sattributes adds the UID only when it knows the pod, and a record
+// without the UID gives a series whose resource has no UID.
 func TestVLLMTwoContainersInOnePod(t *testing.T) {
 	const (
 		prefill = "INFO 10-15 12:00:00 [core.py:77] Initializing a V1 LLM engine (v0.11.0) with config: model='m', served_model_name=prefill, tensor_parallel_size=2, seed=0"
@@ -360,6 +360,11 @@ func TestVLLMTwoContainersInOnePod(t *testing.T) {
 	)
 	resource := func(container string) []kv {
 		return []kv{{"k8s.namespace.name", "inference"}, {"k8s.pod.name", "vllm-pd-0"}, {"k8s.container.name", container}}
+	}
+	// withUID is the resource of a series of a record with the pod UID: the
+	// UID comes last, as in include_resource_attributes.
+	withUID := func(container string) []kv {
+		return append(resource(container), kv{"k8s.pod.uid", "uid-vllm-pd-0"})
 	}
 	facts := func(name, tp string) []kv {
 		return []kv{{"vllm_version", "0.11.0"}, {"model", "m"}, {"vllm_engine", "V1"}, {"served_model_name", name}, {"tensor_parallel_size", tp}}
@@ -373,7 +378,7 @@ func TestVLLMTwoContainersInOnePod(t *testing.T) {
 		{
 			name:   "with_pod_uid",
 			podUID: true,
-			want:   [][2][]kv{{resource("decode"), facts("decode", "4")}, {resource("prefill"), facts("prefill", "2")}},
+			want:   [][2][]kv{{withUID("decode"), facts("decode", "4")}, {withUID("prefill"), facts("prefill", "2")}},
 		},
 		{
 			name: "without_pod_uid",
@@ -383,7 +388,7 @@ func TestVLLMTwoContainersInOnePod(t *testing.T) {
 			name:     "without_container_in_identity",
 			identity: []string{"k8s.namespace.name", "k8s.pod.name"},
 			podUID:   true,
-			want:     [][2][]kv{{resource("decode"), facts("decode", "4")}},
+			want:     [][2][]kv{{withUID("decode"), facts("decode", "4")}},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -417,6 +422,55 @@ func TestVLLMTwoContainersInOnePod(t *testing.T) {
 			assert.Len(t, conn.state.snapshot().Rules["vllm_engine_config_info"], len(tc.want))
 		})
 	}
+}
+
+// TestVLLMReplacedPod checks that a new pod with the name of a previous pod
+// replaces the facts of the previous pod. A StatefulSet, for example, gives
+// the new pod the same name, and the new pod has a new UID. The UID is not
+// in the identity, so the two pods are one entity. The UID is an included
+// resource attribute, so the new UID is a change, also with the same startup
+// line. The connector starts a new series and emits it on change, and the
+// pipeline can drop the series of the previous pod.
+func TestVLLMReplacedPod(t *testing.T) {
+	sink := new(consumertest.MetricsSink)
+	conn, _ := newTestConnector(t, loadVLLMRuleFile(t), sink)
+	logs := func(uid string, ts time.Time) plog.Logs {
+		attrs := vllmPodResource("vllm-0")
+		attrs["k8s.pod.uid"] = uid
+		ld := plog.NewLogs()
+		addRecord(addResource(ld, attrs), ts, vllmStartupLine)
+		return ld
+	}
+	resource := func(uid string) []kv {
+		return []kv{{"k8s.namespace.name", "inference"}, {"k8s.pod.name", "vllm-0"}, {"k8s.container.name", "vllm"}, {"k8s.pod.uid", uid}}
+	}
+	facts := []kv{{"vllm_version", "0.11.0"}, {"model", "m"}, {"vllm_engine", "V1"}, {"tensor_parallel_size", "1"}}
+
+	require.NoError(t, conn.ConsumeLogs(t.Context(), logs("uid-old", base)))
+	require.Len(t, sink.AllMetrics(), 1)
+	first := allSeries(t, sink.AllMetrics())
+	require.Len(t, first, 1)
+	assert.Equal(t, resource("uid-old"), first[0].resource)
+	assert.Equal(t, base, first[0].start)
+
+	// The new pod logs the same startup line a minute later.
+	replaced := base.Add(time.Minute)
+	require.NoError(t, conn.ConsumeLogs(t.Context(), logs("uid-new", replaced)))
+	require.Len(t, sink.AllMetrics(), 2, "the new UID is a change, so the connector emits on change")
+	got := allSeries(t, sink.AllMetrics()[1:])
+	require.Len(t, got, 1)
+	assert.Equal(t, resource("uid-new"), got[0].resource)
+	assert.Equal(t, facts, got[0].attrs)
+	assert.Equal(t, replaced, got[0].start, "the new series starts at the startup line of the new pod")
+
+	entities := conn.state.snapshot().Rules["vllm_engine_config_info"]
+	require.Len(t, entities, 1, "the two pods are one entity")
+	e, ok := entities[vllmKey("vllm-0")]
+	require.True(t, ok)
+	assert.Equal(t, resource("uid-new"), e.Resource)
+	assert.Equal(t, facts, e.Facts)
+	assert.Equal(t, replaced.UnixNano(), e.FirstSeen, "FirstSeen is reset")
+	assert.Equal(t, replaced.UnixNano(), e.Updated)
 }
 
 // noMatchBodies are typical vLLM and application lines that the vLLM rule

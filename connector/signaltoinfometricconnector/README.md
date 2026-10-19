@@ -93,7 +93,10 @@ each container `/var/log/containers/<pod>_<namespace>_<container>-<id>.log`, and
 three names from the file name. Thus, every record has the identity, also before the k8sattributes processor knows
 the pod. The container name is in the identity, because two containers of one pod can each start an engine. The
 `include_resource_attributes` list has the three identity keys, because the connector requires all identity keys
-in this list.
+in this list. The list also has the pod UID, so that the pipeline can compare the UID of a series with the UID of
+the live pod. The UID is not in the identity. Thus, a new pod with the name of a previous pod is the same entity.
+Its startup line replaces the facts and the UID of the previous pod, and starts a new series. The k8sattributes
+processor adds the UID only when it knows the pod. A record without the UID gives a series without the UID.
 
 ```yaml
 extensions:
@@ -117,7 +120,8 @@ connectors:
         # The filelog receiver reads these names from the container log file name, so every record has them.
         # Two containers of one pod are two entities.
         identity: [k8s.namespace.name, k8s.pod.name, k8s.container.name]
-        include_resource_attributes: [k8s.namespace.name, k8s.pod.name, k8s.container.name]
+        # The pod UID is included, so that the pipeline can compare it with the live pod.
+        include_resource_attributes: [k8s.namespace.name, k8s.pod.name, k8s.container.name, k8s.pod.uid]
         attributes:
           - key: vllm_version
             value: 'ExtractPatterns(log.body, "Initializing an? (?:V[01] )?LLM engine \\(v(?P<v>[^)]+)\\) with config: ")["v"]'
@@ -224,9 +228,10 @@ before it adds new entities. Thus, the eviction for a new entity uses the latest
 ### Emission
 
 Each entity is one series: a gauge with the value `1` and the rule name as metric name. The resource has the
-included resource attributes, and thus also the identity. The data point attributes are the facts. The data point
-time is the emission time. The start time is the start of the series. The record time is never the data point
-time, because CloudWatch rejects data points that are older than 14 days.
+included resource attributes, and thus also the identity. If an included resource attribute is missing or empty,
+the resource does not have it. The data point attributes are the facts. The data point time is the emission time.
+The start time is the start of the series. The record time is never the data point time, because CloudWatch
+rejects data points that are older than 14 days.
 
 The connector emits in two ways:
 
@@ -356,8 +361,10 @@ The connector writes these logs at most one time each minute. In `suppressed_sin
 number of events that the connector did not log since the previous log. For the eviction logs, an event is one
 evicted entity.
 
-- Warn, one for `max_entities` and one for `max_state_bytes`: the connector evicted entities because of this
-  limit. The limit is too small for the node.
+- Warn, one for `max_entities` and one for `max_state_bytes`: the connector evicted the least active entities to
+  stay within this limit. The limit is too small only if the evicted entities were still active. For example, the
+  entities of deleted pods are not active, and their eviction is normal. The log has the `limit`, the `rule` of the
+  first evicted entity, and the number of `evicted` entities.
 - Info, one for each rule: a matching record was not used because a required attribute has no value. A change of
   the log format often causes this. If the collector telemetry level is `none`, this log is the only visible sign.
   `error_mode: silent` turns this log off.
