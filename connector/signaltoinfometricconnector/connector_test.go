@@ -8,9 +8,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl"
@@ -382,6 +384,99 @@ func TestConsumeLogsTruncatesResourceAndIdentity(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Equal(t, []kv{{"k8s.pod.name", "pod-u"}, {"k8s.pod.uid", "uid-"}}, got[0].resource)
 	assert.Equal(t, []kv{{"version", "1.2.3"}, {"mode", "dflt"}}, got[0].attrs)
+}
+
+// TestConsumeLogsInvalidUTF8 checks that invalid UTF-8 in a fact, a
+// resource value, and an identity value is replaced with U+FFFD before the
+// cut, so that every emitted value is valid UTF-8 within max_value_length
+// and the metrics marshal to OTLP protobuf.
+func TestConsumeLogsInvalidUTF8(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		maxLen   int
+		resource map[string]string
+		body     string
+		// wantUID is the identity value of the state key.
+		wantUID      string
+		wantResource []kv
+		wantAttrs    []kv
+	}{
+		{
+			name:         "replaced",
+			maxLen:       256,
+			resource:     map[string]string{"k8s.pod.uid": "u\xff1", "k8s.pod.name": "pod-\xfe\xfd"},
+			body:         "app started version=1.\x80 mode=f\xc3ast region=eu",
+			wantUID:      "u\uFFFD1",
+			wantResource: []kv{{"k8s.pod.name", "pod-\uFFFD"}, {"k8s.pod.uid", "u\uFFFD1"}},
+			wantAttrs:    []kv{{"version", "1.\uFFFD"}, {"mode", "f\uFFFDast"}, {"region", "eu"}},
+		},
+		{
+			// The replacement makes "abc\x80" 6 bytes and "pod-u\x80" 8,
+			// and the cut brings them back within 4. It makes the region 3
+			// bytes, from 5, so the region is not cut.
+			name:         "replaced_then_cut",
+			maxLen:       4,
+			resource:     map[string]string{"k8s.pod.uid": "u\x80", "k8s.pod.name": "pod-u\x80"},
+			body:         "app started version=abc\x80 region=\x80\x80\x80\x80\x80",
+			wantUID:      "u\uFFFD",
+			wantResource: []kv{{"k8s.pod.name", "pod-"}, {"k8s.pod.uid", "u\uFFFD"}},
+			wantAttrs:    []kv{{"version", "abc"}, {"mode", "d"}, {"region", "\uFFFD"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.MaxValueLength = tc.maxLen
+			cfg.Rules[0].Attributes[1].DefaultValue = "d"
+			sink := new(consumertest.MetricsSink)
+			conn, _ := newTestConnector(t, cfg, sink)
+			ld := plog.NewLogs()
+			addRecord(addResource(ld, tc.resource), base, tc.body)
+			require.NoError(t, conn.ConsumeLogs(t.Context(), ld))
+
+			got := allSeries(t, sink.AllMetrics())
+			require.Len(t, got, 1)
+			assert.Equal(t, tc.wantResource, got[0].resource)
+			assert.Equal(t, tc.wantAttrs, got[0].attrs)
+			for _, p := range slices.Concat(got[0].resource, got[0].attrs) {
+				assert.LessOrEqual(t, len(p.Value), tc.maxLen, p.Key)
+			}
+			assert.Contains(t, conn.state.snapshot().Rules["app_info"], key(tc.wantUID))
+			assertValidOTLP(t, sink.AllMetrics()[0])
+		})
+	}
+}
+
+// assertValidOTLP checks that every string of md is valid UTF-8, and that md
+// marshals to OTLP protobuf and back. pdata does not check UTF-8 when it
+// marshals, so the check of the strings is what shows that a receiver that
+// checks UTF-8, as protobuf requires for a string field, accepts md.
+func assertValidOTLP(t *testing.T, md pmetric.Metrics) {
+	t.Helper()
+	validMap := func(m pcommon.Map) {
+		for k, v := range m.All() {
+			assert.True(t, utf8.ValidString(k), "key %q", k)
+			assert.True(t, utf8.ValidString(v.AsString()), "value %q of %s", v.AsString(), k)
+		}
+	}
+	for _, rm := range md.ResourceMetrics().All() {
+		validMap(rm.Resource().Attributes())
+		for _, sm := range rm.ScopeMetrics().All() {
+			assert.True(t, utf8.ValidString(sm.Scope().Name()))
+			for _, m := range sm.Metrics().All() {
+				for _, s := range []string{m.Name(), m.Description(), m.Unit()} {
+					assert.True(t, utf8.ValidString(s), "%q", s)
+				}
+				for _, dp := range m.Gauge().DataPoints().All() {
+					validMap(dp.Attributes())
+				}
+			}
+		}
+	}
+	b, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(md)
+	require.NoError(t, err)
+	back, err := (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics(b)
+	require.NoError(t, err)
+	assert.Equal(t, allSeries(t, []pmetric.Metrics{md}), allSeries(t, []pmetric.Metrics{back}))
 }
 
 func TestConsumeLogsFactsChange(t *testing.T) {

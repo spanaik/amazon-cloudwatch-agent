@@ -473,6 +473,25 @@ func TestVLLMReplacedPod(t *testing.T) {
 	assert.Equal(t, replaced.UnixNano(), e.Updated)
 }
 
+// TestVLLMInvalidUTF8 sends a startup line with an invalid byte in the model
+// name, as the filelog receiver passes it with encoding utf8-raw. The model
+// label has U+FFFD in place of the byte, and the metrics marshal to OTLP
+// protobuf.
+func TestVLLMInvalidUTF8(t *testing.T) {
+	sink := new(consumertest.MetricsSink)
+	conn, _ := newTestConnector(t, loadVLLMRuleFile(t), sink)
+	line := strings.Replace(vllmStartupLine, "model='m'", "model='org/m\xffdel'", 1)
+	require.NotEqual(t, vllmStartupLine, line)
+	ld := plog.NewLogs()
+	addRecord(addResource(ld, vllmPodResource("vllm-0")), base, line)
+	require.NoError(t, conn.ConsumeLogs(t.Context(), ld))
+
+	got := allSeries(t, sink.AllMetrics())
+	require.Len(t, got, 1)
+	assert.Equal(t, []kv{{"vllm_version", "0.11.0"}, {"model", "org/m\uFFFDdel"}, {"vllm_engine", "V1"}, {"tensor_parallel_size", "1"}}, got[0].attrs)
+	assertValidOTLP(t, sink.AllMetrics()[0])
+}
+
 // noMatchBodies are typical vLLM and application lines that the vLLM rule
 // does not match.
 var noMatchBodies = []string{

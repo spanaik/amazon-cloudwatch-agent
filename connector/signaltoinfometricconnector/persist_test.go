@@ -514,6 +514,73 @@ func TestNormalizeEntity(t *testing.T) {
 	// So does an identity value longer than max_value_length.
 	_, ok = normalizeEntity(e, rc, 1)
 	assert.False(t, ok)
+
+	// Invalid UTF-8 in a fact or resource value is replaced with U+FFFD,
+	// then cut to max_value_length.
+	e.Facts = []kv{{"version", "1\xff"}, {"region", "abc\x80"}}
+	e.Resource = []kv{{"k8s.pod.name", "p\xfe\xfd"}}
+	got, ok = normalizeEntity(e, rc, 4)
+	require.True(t, ok)
+	assert.Equal(t, []kv{{"version", "1\uFFFD"}, {"region", "abc"}}, got.Facts)
+	assert.Equal(t, []kv{{"k8s.pod.name", "p\uFFFD"}}, got.Resource)
+	// An identity value that is not valid UTF-8 drops the entity: a record
+	// gives the replaced value, so no record gives its state key.
+	e.Identity = []kv{{"k8s.pod.uid", "u\xff"}}
+	_, ok = normalizeEntity(e, rc, 256)
+	assert.False(t, ok)
+}
+
+// TestNormalizeSnapshotInvalidUTF8 checks that the normalization replaces
+// invalid UTF-8 in the restored facts and resource values, and counts the
+// entity as changed, so that the cleaned state is written. It gives the
+// snapshot directly, because the JSON decoder of the store already replaces
+// invalid bytes (see TestPersistRestoreInvalidUTF8).
+func TestNormalizeSnapshotInvalidUTF8(t *testing.T) {
+	cfg := testConfig()
+	stored := func(uid string) entity {
+		return entity{
+			Identity: []kv{{"k8s.pod.uid", uid}},
+			Resource: []kv{{"k8s.pod.name", "pod-\xff"}, {"k8s.pod.uid", uid}},
+			Facts:    []kv{{"version", "1.\xfe\xfd"}, {"mode", "fast"}},
+		}
+	}
+	snap := stateSnapshot{Rules: map[string]map[string]entity{"app_info": {
+		key("u1"):    stored("u1"),
+		key("u\xff"): stored("u\xff"),
+	}}}
+	assert.Equal(t, normalizeResult{dropped: 1, changed: 1}, normalizeSnapshot(&snap, cfg))
+	assert.Equal(t, map[string]entity{key("u1"): {
+		Identity: []kv{{"k8s.pod.uid", "u1"}},
+		Resource: []kv{{"k8s.pod.name", "pod-\uFFFD"}, {"k8s.pod.uid", "u1"}},
+		Facts:    []kv{{"version", "1.\uFFFD"}, {"mode", "fast"}},
+	}}, snap.Rules["app_info"])
+}
+
+// TestPersistRestoreInvalidUTF8 restores a stored record with invalid UTF-8
+// bytes in a fact and a resource value. The restored values are valid
+// UTF-8, and the first tick marshals to OTLP protobuf. The JSON decoder
+// replaces each invalid byte with U+FFFD, so here the run of two bytes gives
+// two U+FFFD.
+func TestPersistRestoreInvalidUTF8(t *testing.T) {
+	ctx := context.Background()
+	mem := newMemStorage()
+	mem.client.put(strings.NewReplacer("<ff>", "\xff", "<fe>", "\xfe").Replace(`{"version":1,"data":{"rules":{"app_info":{"2:u1":{` +
+		`"identity":[{"key":"k8s.pod.uid","value":"u1"}],` +
+		`"resource":[{"key":"k8s.pod.name","value":"pod-<ff>"},{"key":"k8s.pod.uid","value":"u1"}],` +
+		`"facts":[{"key":"version","value":"1.<fe><ff>"},{"key":"mode","value":"fast"}],` +
+		`"first_seen":1,"updated":2,"activity":3}}}}}`))
+	sink := new(consumertest.MetricsSink)
+	conn, _ := newStorageConnector(t, testConfig(), sink)
+	require.NoError(t, conn.Start(ctx, mem.host()))
+	e, ok := conn.state.snapshot().Rules["app_info"][key("u1")]
+	require.True(t, ok)
+	assert.Equal(t, []kv{{"k8s.pod.name", "pod-\uFFFD"}, {"k8s.pod.uid", "u1"}}, e.Resource)
+	assert.Equal(t, []kv{{"version", "1.\uFFFD\uFFFD"}, {"mode", "fast"}}, e.Facts)
+
+	conn.tick(ctx, &conn.groups[0])
+	require.Len(t, sink.AllMetrics(), 1)
+	assertValidOTLP(t, sink.AllMetrics()[0])
+	require.NoError(t, conn.Shutdown(ctx))
 }
 
 // TestPersistUnusableRecord checks that a missing, corrupt, or other

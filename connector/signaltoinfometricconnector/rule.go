@@ -117,11 +117,11 @@ type resourceInfo struct {
 }
 
 // resolveResource reads the identity and the included resource attributes.
-// Values are converted with AsString, truncated to maxLen bytes, and cloned
-// so that the state does not keep the input's memory alive. An included
-// attribute that is absent or empty is omitted. The identity key is
-// computed from the truncated values, so the state and the emitted labels
-// agree.
+// Values are converted with AsString, made valid UTF-8 and cut to maxLen
+// bytes by fitValue, and cloned so that the state does not keep the input's
+// memory alive. An included attribute that is absent or empty is omitted.
+// The identity key is computed from the fitted values, so the state and the
+// emitted labels agree.
 func (r *compiledRule) resolveResource(attrs pcommon.Map, maxLen int) resourceInfo {
 	truncated := 0
 	identity := make([]kv, 0, len(r.cfg.Identity))
@@ -130,7 +130,7 @@ func (r *compiledRule) resolveResource(attrs pcommon.Map, maxLen int) resourceIn
 		if !ok {
 			return resourceInfo{resolved: true, truncated: truncated}
 		}
-		s := truncateCounted(v.AsString(), maxLen, &truncated)
+		s := fitCounted(v.AsString(), maxLen, &truncated)
 		if s == "" {
 			return resourceInfo{resolved: true, truncated: truncated}
 		}
@@ -145,7 +145,7 @@ func (r *compiledRule) resolveResource(attrs pcommon.Map, maxLen int) resourceIn
 		if !ok {
 			continue
 		}
-		if s := truncateCounted(v.AsString(), maxLen, &truncated); s != "" {
+		if s := fitCounted(v.AsString(), maxLen, &truncated); s != "" {
 			resource = append(resource, kv{Key: k, Value: strings.Clone(s)})
 		}
 	}
@@ -160,17 +160,18 @@ func (r *compiledRule) resolveResource(attrs pcommon.Map, maxLen int) resourceIn
 }
 
 // appendIdentityKey appends the state key of the resource's identity to
-// buf. The key is the one that resolveResource computes, but it is built
-// without allocating when the identity values are strings. It returns
-// false when an identity attribute is missing or empty, and then buf can
-// hold part of a key past its original length.
+// buf. The key is the one that resolveResource computes, with the same
+// fitValue, so an entity whose identity had invalid UTF-8 is found. It is
+// built without allocating when the identity values are strings of valid
+// UTF-8. It returns false when an identity attribute is missing or empty,
+// and then buf can hold part of a key past its original length.
 func (r *compiledRule) appendIdentityKey(buf []byte, attrs pcommon.Map, maxLen int) ([]byte, bool) {
 	for _, k := range r.cfg.Identity {
 		v, ok := attrs.Get(k)
 		if !ok {
 			return buf, false
 		}
-		s := truncateUTF8(v.AsString(), maxLen)
+		s := fitValue(v.AsString(), maxLen)
 		if s == "" {
 			return buf, false
 		}
@@ -191,8 +192,9 @@ type factsResult struct {
 	truncated int
 }
 
-// extractFacts evaluates the attributes in config order. A value that is an
-// error, nil, or empty (also after truncation) is missing: default_value
+// extractFacts evaluates the attributes in config order. Each result is
+// made valid UTF-8 and cut to maxLen bytes by fitValue. A value that is an
+// error, nil, or empty (also after the cut) is missing: default_value
 // replaces it, optional omits it, and otherwise the record is not used
 // (missing names the attribute). The error is non-nil only in
 // propagate mode, when a required fact without a default fails to
@@ -204,7 +206,7 @@ func (r *compiledRule) extractFacts(ctx context.Context, tCtx *ottllog.Transform
 		raw, err := attr.expr.Eval(ctx, tCtx)
 		var v string
 		if err == nil {
-			v = truncateCounted(valueString(raw), maxLen, &res.truncated)
+			v = fitCounted(valueString(raw), maxLen, &res.truncated)
 		}
 		switch {
 		case v != "":
@@ -278,13 +280,37 @@ func valueString(v any) string {
 	return val.AsString()
 }
 
-// truncateCounted is truncateUTF8 that adds 1 to *count when it cuts s.
-func truncateCounted(s string, n int, count *int) string {
-	t := truncateUTF8(s, n)
-	if len(t) < len(s) {
+// fitValue returns a value as the connector stores and emits it: valid
+// UTF-8 of at most n bytes. It replaces each run of invalid UTF-8 bytes
+// with U+FFFD (validUTF8), then cuts the result to n bytes (truncateUTF8).
+// The replacement comes first because it can make the value longer, and
+// the cut of a valid string never splits a character, so the result is
+// valid and within n. A valid value that fits n is returned as is.
+func fitValue(s string, n int) string {
+	return truncateUTF8(validUTF8(s), n)
+}
+
+// fitCounted is fitValue that adds 1 to *count when the cut shortens the
+// value.
+func fitCounted(s string, n int, count *int) string {
+	v := validUTF8(s)
+	t := truncateUTF8(v, n)
+	if len(t) < len(v) {
 		*count++
 	}
 	return t
+}
+
+// validUTF8 returns s with each run of invalid UTF-8 bytes replaced by
+// U+FFFD. The filelog receiver with encoding utf8-raw passes the bytes of a
+// line as they are, and a string attribute that is not valid UTF-8 is not a
+// valid protobuf string: a receiver can refuse the whole export request
+// that holds it. A valid s is checked without allocating and returned as is.
+func validUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, "\uFFFD")
 }
 
 // truncateUTF8 returns s cut to at most n bytes without splitting a UTF-8

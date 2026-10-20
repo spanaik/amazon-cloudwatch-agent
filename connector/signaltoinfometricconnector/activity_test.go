@@ -128,6 +128,37 @@ func TestActivityUntrackedPodCreatesNoEntity(t *testing.T) {
 	assert.Equal(t, hookCounts{}, *hooks)
 }
 
+// TestActivityInvalidUTF8Identity checks that the activity path builds the
+// state key that the entity was stored with when the identity value has
+// invalid UTF-8, so that a later record of the pod still moves its
+// Activity.
+func TestActivityInvalidUTF8Identity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		maxLen int
+		uid    string
+		// stored is the identity value of the state key.
+		stored string
+	}{
+		{name: "replaced", maxLen: 256, uid: "u\xff\xfe1", stored: "u\uFFFD1"},
+		// "abc\x80" fits 4 bytes, but "abc\uFFFD" does not.
+		{name: "replaced_then_cut", maxLen: 4, uid: "abc\x80", stored: "abc"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.MaxValueLength = tc.maxLen
+			cfg.Rules[0].Attributes[1].DefaultValue = "d"
+			conn, _ := newTestConnector(t, cfg, consumertest.NewNop())
+			require.NoError(t, conn.ConsumeLogs(t.Context(), podLogs(tc.uid, base, "app started version=1")))
+			assert.Equal(t, base, activityOf(t, conn, tc.stored))
+			hooks := countHooks(conn)
+			require.NoError(t, conn.ConsumeLogs(t.Context(), podLogs(tc.uid, base.Add(time.Minute), "noise")))
+			assert.Equal(t, base.Add(time.Minute), activityOf(t, conn, tc.stored))
+			assert.Equal(t, hookCounts{touched: 1}, *hooks)
+		})
+	}
+}
+
 func TestActivityClampsFutureTime(t *testing.T) {
 	conn, _ := newTestConnector(t, testConfig(), consumertest.NewNop())
 	require.NoError(t, conn.ConsumeLogs(t.Context(), podLogs("u1", base, "app started version=1")))
