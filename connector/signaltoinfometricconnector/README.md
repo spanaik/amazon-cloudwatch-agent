@@ -192,7 +192,9 @@ records of that resource. Then the connector gets the facts in the configured or
 
 Values that are not strings are converted as by `pcommon.Value.AsString`. For example, the integer 4 becomes `"4"`.
 The connector replaces each sequence of bytes that is not valid UTF-8 with the character U+FFFD, also in the
-restored state. Without this replacement, one such value can make the export of a full batch of metrics fail.
+restored state. Without this replacement, a receiver that checks UTF-8 can reject the batch that holds such a
+value. CloudWatch PromQL does not accept U+FFFD in a query string. To match a label value with U+FFFD, use a
+regular expression, for example `.` in place of the character.
 After the replacement, each value, also each resource attribute and identity value, is cut to `max_value_length`
 bytes. The cut is at a UTF-8 character boundary. A value that is empty after the cut counts as missing.
 
