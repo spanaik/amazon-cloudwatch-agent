@@ -302,10 +302,10 @@ func fitCounted(s string, n int, count *int) string {
 }
 
 // validUTF8 returns s with each run of invalid UTF-8 bytes replaced by
-// U+FFFD. The filelog receiver with encoding utf8-raw passes the bytes of a
-// line as they are, and a string attribute that is not valid UTF-8 is not a
-// valid protobuf string: a receiver can refuse the whole export request
-// that holds it. A valid s is checked without allocating and returned as is.
+// U+FFFD. A receiver can pass bytes that are not valid UTF-8, for example
+// the filelog receiver with encoding utf8-raw. A string attribute that is not
+// valid UTF-8 is not a valid protobuf string, and a strict receiver can
+// refuse the whole export request that holds it. A valid s is checked without allocating and returned as is.
 func validUTF8(s string) string {
 	if utf8.ValidString(s) {
 		return s

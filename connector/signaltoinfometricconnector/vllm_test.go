@@ -474,7 +474,7 @@ func TestVLLMReplacedPod(t *testing.T) {
 }
 
 // TestVLLMInvalidUTF8 sends a startup line with an invalid byte in the model
-// name, as the filelog receiver passes it with encoding utf8-raw. The model
+// name, as a receiver without UTF-8 validation passes it. The model
 // label has U+FFFD in place of the byte, and the metrics marshal to OTLP
 // protobuf.
 func TestVLLMInvalidUTF8(t *testing.T) {
