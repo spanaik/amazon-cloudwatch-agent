@@ -89,9 +89,9 @@ The example keeps the state in `file_storage/state` and emits every 30 seconds. 
 `testdata/vllm_rule.yaml`, with all 14 facts of the vLLM engine startup line.
 
 The identity of the rule is the namespace, the pod name, and the container name. The kubelet names the log file of
-each container `/var/log/containers/<pod>_<namespace>_<container>-<id>.log`, and the filelog receiver reads the
-three names from the file name. Thus, every record has the identity, also before the k8sattributes processor knows
-the pod. The container name is in the identity, because two containers of one pod can each start an engine. The
+each container `/var/log/containers/<pod>_<namespace>_<container>-<id>.log`. The filelog receiver of the example
+must set the three names from the file name, for example with a `regex_parser` operator on `log.file.path`. Thus,
+every record has the identity, also before the k8sattributes processor knows the pod. The container name is in the identity, because two containers of one pod can each start an engine. The
 `include_resource_attributes` list has the three identity keys, because the connector requires all identity keys
 in this list. The list also has the pod UID, so that the pipeline can compare the UID of a series with the UID of
 the live pod. The UID is not in the identity. Thus, a new pod with the name of a previous pod is the same entity.
@@ -173,7 +173,10 @@ service:
   extensions: [file_storage/state]
   pipelines:
     logs:
+      # filelog sets k8s.namespace.name, k8s.pod.name, and k8s.container.name from the log file name,
+      # and k8sattributes adds k8s.pod.uid. The example does not show their configuration.
       receivers: [filelog]
+      processors: [k8sattributes]
       exporters: [awscloudwatchlogs, signal_to_info_metric/vllm]
     metrics/info:
       receivers: [signal_to_info_metric/vllm]
