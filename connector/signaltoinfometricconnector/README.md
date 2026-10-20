@@ -96,7 +96,7 @@ the pod. The container name is in the identity, because two containers of one po
 in this list. The list also has the pod UID, so that the pipeline can compare the UID of a series with the UID of
 the live pod. The UID is not in the identity. Thus, a new pod with the name of a previous pod is the same entity.
 Its startup line replaces the facts and the UID of the previous pod, and starts a new series. The k8sattributes
-processor adds the UID only when it knows the pod. A record without the UID gives a series without the UID.
+processor adds the UID to a record of a pod that it knows. A record without the UID gives a series without the UID.
 
 ```yaml
 extensions:
@@ -191,8 +191,10 @@ one time for each resource and rule. If an identity key is missing or its value 
 records of that resource. Then the connector gets the facts in the configured order.
 
 Values that are not strings are converted as by `pcommon.Value.AsString`. For example, the integer 4 becomes `"4"`.
-Each value, also each resource attribute and identity value, is cut to `max_value_length` bytes. The cut is at a
-UTF-8 character boundary. A value that is empty after the cut counts as missing.
+The connector replaces each sequence of bytes that is not valid UTF-8 with the character U+FFFD, also in the
+restored state. Without this replacement, one such value can make the export of a full batch of metrics fail.
+After the replacement, each value, also each resource attribute and identity value, is cut to `max_value_length`
+bytes. The cut is at a UTF-8 character boundary. A value that is empty after the cut counts as missing.
 
 With `error_mode: propagate`, the connector stops the batch at an evaluation error. This applies to the
 conditions, and to a required attribute without `default_value`. The connector returns the error. It still
@@ -303,8 +305,8 @@ The connector fits the restored state to the current configuration:
   `default_value`, because the default value can be wrong for the entity.
 - The resource keeps only the `include_resource_attributes`, in that order. The connector cuts each value to
   `max_value_length`.
-- If an identity value is longer than `max_value_length`, the connector removes the entity. No record can give
-  its identity again.
+- If an identity value is longer than `max_value_length` or is not valid UTF-8, the connector removes the entity.
+  No record can give its identity again.
 - `max_entities` and `max_state_bytes` apply. The connector keeps the entities with the latest activity.
 
 After it reads a record, the connector writes one Info log with the number of entities that it kept, removed, and
@@ -362,7 +364,7 @@ number of events that the connector did not log since the previous log. For the 
 evicted entity.
 
 - Warn, one for `max_entities` and one for `max_state_bytes`: the connector evicted the least active entities to
-  stay within this limit. The limit is too small only if the evicted entities were still active. For example, the
+  stay within this limit. If the evicted entities were still active, the limit is too small. For example, the
   entities of deleted pods are not active, and their eviction is normal. The log has the `limit`, the `rule` of the
   first evicted entity, and the number of `evicted` entities.
 - Info, one for each rule: a matching record was not used because a required attribute has no value. A change of

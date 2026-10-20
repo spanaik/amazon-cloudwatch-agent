@@ -49,6 +49,54 @@ func TestTruncateUTF8(t *testing.T) {
 	}
 }
 
+func TestFitValue(t *testing.T) {
+	const r = "\uFFFD"
+	testCases := []struct {
+		name string
+		in   string
+		n    int
+		want string
+		// cut is set when the cut shortens the value after the replacement.
+		cut bool
+	}{
+		{name: "valid", in: "abc", n: 4, want: "abc"},
+		{name: "valid_cut", in: "abcdef", n: 4, want: "abcd", cut: true},
+		{name: "invalid_byte", in: "a\xffb", n: 8, want: "a" + r + "b"},
+		// A run of invalid bytes gives one U+FFFD.
+		{name: "invalid_run", in: "a\xff\xfe\xfdb", n: 8, want: "a" + r + "b"},
+		{name: "incomplete_sequence", in: "a\xe6\x97", n: 8, want: "a" + r},
+		{name: "lone_continuation_byte", in: "\x80", n: 8, want: r},
+		// The replacement makes the value longer, 4 bytes to 6. The cut
+		// after it keeps n and does not split U+FFFD.
+		{name: "replacement_then_cut", in: "abc\x80", n: 4, want: "abc", cut: true},
+		{name: "replacement_fits", in: "a\x80", n: 4, want: "a" + r},
+		// The replacement makes the value shorter, 5 bytes to 3, so there
+		// is no cut.
+		{name: "replacement_shorter", in: "\x80\x81\x82\x83\x84", n: 3, want: r},
+		{name: "replacement_does_not_fit", in: "\xff", n: 2, want: "", cut: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, fitValue(tc.in, tc.n))
+			count := 0
+			got := fitCounted(tc.in, tc.n, &count)
+			assert.Equal(t, tc.want, got)
+			assert.True(t, utf8.ValidString(got))
+			assert.LessOrEqual(t, len(got), tc.n)
+			assert.Equal(t, tc.cut, count == 1)
+		})
+	}
+
+	// A valid value is checked without allocating and returned as is.
+	valid := strings.Repeat("vLLM 日本 😀 ", 40)
+	var got string
+	allocs := testing.AllocsPerRun(10, func() {
+		got = fitValue(valid, 1024)
+	})
+	assert.Zero(t, allocs)
+	assert.True(t, sameMemory(valid, got))
+}
+
 func TestValueString(t *testing.T) {
 	m := pcommon.NewMap()
 	m.PutStr("a", "b")
@@ -237,6 +285,26 @@ func TestResolveResource(t *testing.T) {
 	m.PutStr("k8s.pod.uid", "é")
 	m.PutStr("k8s.container.name", "c")
 	assert.False(t, rule.resolveResource(m, 1).ok)
+
+	// Invalid UTF-8 in an identity or resource value is replaced with
+	// U+FFFD, and the key is computed from the replaced value.
+	m = pcommon.NewMap()
+	m.PutStr("k8s.pod.uid", "uid-\xff1")
+	m.PutStr("k8s.container.name", "vllm")
+	m.PutStr("k8s.pod.name", "pod\xfe\xfd1")
+	got = rule.resolveResource(m, 256)
+	require.True(t, got.ok)
+	assert.Equal(t, []kv{{"k8s.pod.uid", "uid-\uFFFD1"}, {"k8s.container.name", "vllm"}}, got.identity)
+	assert.Equal(t, "8:uid-\uFFFD14:vllm", got.key)
+	assert.Equal(t, []kv{{"k8s.pod.name", "pod\uFFFD1"}}, got.resource)
+	assert.Zero(t, got.truncated)
+	// The cut comes after the replacement. "uid-\xff1" is 6 bytes and
+	// "uid-\uFFFD1" is 8, so a limit of 6 cuts it before U+FFFD.
+	got = rule.resolveResource(m, 6)
+	require.True(t, got.ok)
+	assert.Equal(t, []kv{{"k8s.pod.uid", "uid-"}, {"k8s.container.name", "vllm"}}, got.identity)
+	assert.Equal(t, []kv{{"k8s.pod.name", "pod\uFFFD"}}, got.resource)
+	assert.Equal(t, 2, got.truncated)
 }
 
 // TestResolvedValuesDoNotAliasInput checks that stored values are copies, so
@@ -278,6 +346,12 @@ func TestAppendIdentityKey(t *testing.T) {
 		{name: "missing", identity: []string{"k8s.pod.uid", "k8s.container.name"}, attrs: func(m pcommon.Map) { m.PutStr("k8s.pod.uid", "uid-1") }, maxLen: 256},
 		{name: "empty", identity: []string{"k8s.pod.uid"}, attrs: func(m pcommon.Map) { m.PutStr("k8s.pod.uid", "") }, maxLen: 256},
 		{name: "empty_after_truncation", identity: []string{"k8s.pod.uid"}, attrs: func(m pcommon.Map) { m.PutStr("k8s.pod.uid", "é") }, maxLen: 1},
+		{name: "invalid_utf8", identity: []string{"k8s.pod.uid", "k8s.container.name"}, attrs: func(m pcommon.Map) {
+			m.PutStr("k8s.pod.uid", "uid-\xff\xfe1")
+			m.PutStr("k8s.container.name", "v\x80")
+		}, maxLen: 256, wantOK: true},
+		{name: "invalid_utf8_then_cut", identity: []string{"k8s.pod.uid"}, attrs: func(m pcommon.Map) { m.PutStr("k8s.pod.uid", "uid\x80") }, maxLen: 4, wantOK: true},
+		{name: "invalid_utf8_empty_after_cut", identity: []string{"k8s.pod.uid"}, attrs: func(m pcommon.Map) { m.PutStr("k8s.pod.uid", "\x80") }, maxLen: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rule := compiledRule{cfg: &RuleConfig{Identity: tc.identity}}

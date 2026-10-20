@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/component"
 	"go.uber.org/zap"
@@ -158,17 +159,21 @@ type normalizeResult struct {
 // one that the same record gives under this configuration:
 //
 //   - Facts: only the configured attributes, in config order, with the
-//     values cut to max_value_length. An entity without a value for a
-//     required attribute (no default_value, not optional) is dropped,
-//     because a record without that value is not used. An attribute without
-//     a stored value is otherwise absent: default_value replaces the result
-//     of the value expression, and the stored entity has no record to
-//     evaluate.
+//     values made valid UTF-8 and cut to max_value_length by fitValue. An
+//     entity without a value for a required attribute (no default_value,
+//     not optional) is dropped, because a record without that value is not
+//     used. An attribute without a stored value is otherwise absent:
+//     default_value replaces the result of the value expression, and the
+//     stored entity has no record to evaluate.
 //   - Resource: only the include_resource_attributes, in that order, with
-//     the values cut to max_value_length.
+//     the values fitted the same way.
 //   - Identity: an entity with an identity value longer than
-//     max_value_length is dropped, because no record gives its state key
-//     any more.
+//     max_value_length, or not valid UTF-8, is dropped, because no record
+//     gives its state key any more.
+//
+// The JSON decoder already replaces each invalid UTF-8 byte of the record
+// with U+FFFD. The checks here do not depend on it, so a restored entity
+// cannot bring invalid UTF-8 back into the emission.
 //
 // state.restore drops the entities of rules that are no longer configured
 // and the entities whose identity does not match the rule.
@@ -196,14 +201,14 @@ func normalizeSnapshot(snap *stateSnapshot, cfg *Config) normalizeResult {
 // to be dropped; see normalizeSnapshot.
 func normalizeEntity(e entity, rc *RuleConfig, maxLen int) (entity, bool) {
 	for _, p := range e.Identity {
-		if len(p.Value) > maxLen {
+		if len(p.Value) > maxLen || !utf8.ValidString(p.Value) {
 			return entity{}, false
 		}
 	}
 	facts := make([]kv, 0, len(rc.Attributes))
 	for i := range rc.Attributes {
 		attr := &rc.Attributes[i]
-		if v := truncateUTF8(pairValue(e.Facts, attr.Key), maxLen); v != "" {
+		if v := fitValue(pairValue(e.Facts, attr.Key), maxLen); v != "" {
 			facts = append(facts, kv{Key: attr.Key, Value: v})
 		} else if attr.DefaultValue == "" && !attr.Optional {
 			return entity{}, false
@@ -211,7 +216,7 @@ func normalizeEntity(e entity, rc *RuleConfig, maxLen int) (entity, bool) {
 	}
 	var resource []kv
 	for _, k := range rc.IncludeResourceAttributes {
-		if v := truncateUTF8(pairValue(e.Resource, k), maxLen); v != "" {
+		if v := fitValue(pairValue(e.Resource, k), maxLen); v != "" {
 			resource = append(resource, kv{Key: k, Value: v})
 		}
 	}
