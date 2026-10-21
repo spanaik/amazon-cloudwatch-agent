@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
 	"golang.org/x/exp/maps"
 
@@ -20,7 +21,9 @@ import (
 // receiver_creator have keys of the named string type observer.EndpointType.
 func TestDefaultConfigsMarshal(t *testing.T) {
 	factories, err := Factories()
-	assert.NoError(t, err)
+	require.NoError(t, err)
+	// Each configuration is a field of a struct, as it is in otelcol.Config, so that the
+	// encode hooks see it as a nested value and Marshal returns a map.
 	type wrapper struct {
 		Config any `mapstructure:"config"`
 	}
