@@ -167,7 +167,8 @@ func (e *Encoder) encodeSlice(value reflect.Value) (any, error) {
 }
 
 // encodeMap encodes a map by encoding the key and value. Returns errNonStringEncodedKey
-// if the key is not encoded into a string.
+// if the key is not encoded into a string. A key of a named string type, for example
+// observer.EndpointType, encodes to its string value.
 func (e *Encoder) encodeMap(value reflect.Value) (any, error) {
 	if value.Kind() != reflect.Map {
 		return nil, &reflect.ValueError{
@@ -185,11 +186,12 @@ func (e *Encoder) encodeMap(value reflect.Value) (any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("error encoding key: %w", err)
 		}
-		key, ok := encoded.(string)
-		if !ok {
+		encodedKey := reflect.ValueOf(encoded)
+		if encodedKey.Kind() != reflect.String {
 			return nil, fmt.Errorf("%w key %q, kind: %v", errNonStringEncodedKey, iterator.Key().Interface(), iterator.Key().Kind())
 		}
-		if _, ok = result[key]; ok {
+		key := encodedKey.String()
+		if _, ok := result[key]; ok {
 			return nil, fmt.Errorf("duplicate key %q while encoding", key)
 		}
 		if result[key], err = e.encode(iterator.Value()); err != nil {
