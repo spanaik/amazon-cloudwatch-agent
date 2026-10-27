@@ -86,6 +86,7 @@ func TestComponents(t *testing.T) {
 		"span",
 		"tail_sampling",
 		"transform",
+		"vllmconfig",
 	}
 	gotProcessors := collections.MapSlice(maps.Keys(factories.Processors), component.Type.String)
 	assert.Equal(t, len(wantProcessors), len(gotProcessors))

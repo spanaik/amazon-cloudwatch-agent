@@ -93,6 +93,7 @@ import (
 	"github.com/aws/amazon-cloudwatch-agent/plugins/processors/gpuattributes"
 	"github.com/aws/amazon-cloudwatch-agent/plugins/processors/kueueattributes"
 	"github.com/aws/amazon-cloudwatch-agent/plugins/processors/nodemetadataenricher"
+	"github.com/aws/amazon-cloudwatch-agent/plugins/processors/vllmconfig"
 	"github.com/aws/amazon-cloudwatch-agent/processor/rollupprocessor"
 	"github.com/aws/amazon-cloudwatch-agent/receiver/awsnvmereceiver"
 	"github.com/aws/amazon-cloudwatch-agent/receiver/systemmetricsreceiver"
@@ -163,6 +164,7 @@ func Factories() (otelcol.Factories, error) {
 		spanprocessor.NewFactory(),
 		tailsamplingprocessor.NewFactory(),
 		transformprocessor.NewFactory(),
+		vllmconfig.NewFactory(),
 	); err != nil {
 		return otelcol.Factories{}, err
 	}
