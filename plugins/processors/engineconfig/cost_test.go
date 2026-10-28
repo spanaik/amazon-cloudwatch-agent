@@ -244,6 +244,9 @@ func TestCost(t *testing.T) {
 			assert.Equal(t, r.configured, configured, name)
 		}
 		for k, v := range eng.scraped(base.ResourceMetrics().At(0)) {
+			if internalValues[k] {
+				continue // identity or phase, not an effective value of the record
+			}
 			assert.Equal(t, v.value, r.effective[k], name+" "+k)
 		}
 
