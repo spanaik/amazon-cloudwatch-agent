@@ -1,10 +1,11 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT
 
-package vllmconfig
+package engineconfig
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 const (
@@ -206,21 +210,27 @@ func TestParseVersionBody(t *testing.T) {
 }
 
 func TestParseModelsBody(t *testing.T) {
-	model, maxLen, ok := parseModelsBody([]byte(openAIModels))
+	model, served, maxLen, ok := parseModelsBody([]byte(openAIModels))
 	assert.True(t, ok)
 	assert.Equal(t, "Qwen/Qwen2.5-0.5B-Instruct", model)
+	assert.Equal(t, "Qwen/Qwen2.5-0.5B-Instruct", served)
 	assert.Equal(t, "2048", maxLen)
 
 	// a LoRA adapter (with a parent) listed first, and no root: the base model by id
-	model, maxLen, ok = parseModelsBody([]byte(`{"object":"list","data":[` +
+	model, served, maxLen, ok = parseModelsBody([]byte(`{"object":"list","data":[` +
 		`{"id":"sql-lora","root":"/adapters/sql","parent":"base"},{"id":"base","max_model_len":8192}]}`))
 	assert.True(t, ok)
 	assert.Equal(t, "base", model)
+	assert.Equal(t, "base", served)
+	// a served model name: id is the name, root the model
+	model, served, _, _ = parseModelsBody([]byte(`{"object":"list","data":[{"id":"llama-70b","root":"/models/llama"}]}`))
+	assert.Equal(t, "/models/llama", model)
+	assert.Equal(t, "llama-70b", served)
 	assert.Equal(t, "8192", maxLen)
 
 	for _, b := range []string{`{"models":["tinyllama"]}`, `{"object":"list","data":[]}`, `{"object":"model","data":[{"id":"x"}]}`,
 		`{"error":"Unauthorized"}`, promText, `[]`} {
-		_, _, ok := parseModelsBody([]byte(b))
+		_, _, _, ok := parseModelsBody([]byte(b))
 		assert.False(t, ok, b)
 	}
 }
@@ -236,7 +246,137 @@ func TestCacheConfigFromMetrics(t *testing.T) {
 	dp.Attributes().PutStr("enable_prefix_caching", "False")
 	dp.Attributes().PutStr("gpu_memory_utilization", "0.85")
 	dp.Attributes().PutStr("block_size", "16")
+	dp.Attributes().PutStr("num_gpu_blocks", "682")
 	assert.Equal(t, map[string]string{
-		valKVCacheDtype: "fp8", valEnablePrefixCaching: "false", valGPUMemoryUtilization: "0.85",
+		valKVCacheDtype: "fp8", valEnablePrefixCaching: "false", valGPUMemoryUtilization: "0.85", valNumGPUBlocks: "682",
 	}, cacheConfigFromMetrics(rm))
+	dp.Attributes().PutStr("num_gpu_blocks", "None")
+	assert.NotContains(t, cacheConfigFromMetrics(rm), valNumGPUBlocks)
+}
+
+// serverInfoBody is an SGLang /server_info body with the secrets that it carries.
+var serverInfoBody = `{"model_path":"Qwen/Qwen3-8B","served_model_name":"qwen3","tp_size":2,"pp_size":1,"dp_size":1,` +
+	`"dtype":"auto","quantization":null,"kv_cache_dtype":"auto","mem_fraction_static":0.871,` +
+	`"chunked_prefill_size":8192,"max_prefill_tokens":16384,"max_running_requests":null,"context_length":40960,` +
+	`"schedule_policy":"fcfs","disable_radix_cache":false,"disable_cuda_graph":false,"speculative_algorithm":null,` +
+	`"attention_backend":"fa3","disaggregation_mode":"null","api_key":"` + secretValue + `",` +
+	`"admin_api_key":"admin-` + secretValue + `","launch_command":"sglang serve --api-key ` + secretValue + `",` +
+	`"lora_paths":["/adapters/` + secretValue + `"],"internal_states":[{"pad":"` + strings.Repeat("x", 100<<10) + `"}],` +
+	`"version":"0.5.22","frontend":"python"}`
+
+// deniedFields are the deny list of the research note (section 7), with one
+// concrete key per pattern.
+var deniedFields = []string{
+	"api_key", "admin_api_key", "ssl_keyfile_password", "ssl_keyfile", "ssl_certfile", "ssl_ca_certs",
+	"launch_command", "watermark_key", "watermark_key_b", "watermark_config", "hicache_storage_backend_extra_config",
+	"model_loader_extra_config", "modelexpress_config", "kv_events_config", "sidecar_args", "tool_server",
+	"otlp_traces_endpoint", "lora_paths", "json_model_override_args",
+	"remote_instance_weight_loader_seed_instance_ip", "remote_instance_weight_loader_backend", "env_vars",
+}
+
+func TestServerInfoDenyList(t *testing.T) {
+	for _, k := range deniedFields {
+		assert.True(t, sglangDenied(k), k)
+	}
+	for _, k := range sglangValues {
+		assert.False(t, sglangDenied(k), "an allowlisted key is denied: %s", k)
+	}
+	// every denied field holds a secret, at the top level and in each
+	// internal_states entry; an allowlisted key that the top level lacks comes
+	// from the first entry
+	entry := func(extra string) string {
+		var b strings.Builder
+		b.WriteString("{" + extra)
+		for _, k := range deniedFields {
+			b.WriteString(`"` + k + `":"` + secretValue + `-` + k + `",`)
+		}
+		b.WriteString(`"world_size":2}`)
+		return b.String()
+	}
+	body := entry(`"version":"0.5.22","tp_size":2,`)
+	body = body[:len(body)-1] + `,"internal_states":[` + entry(`"max_running_requests":48,"tp_size":4,`) + "," +
+		entry(`"max_running_requests":96,`) + "]}"
+	values := parseServerInfo([]byte(body))
+	assert.Equal(t, map[string]string{sgVersion: "0.5.22", "tp_size": "2", "max_running_requests": "48"}, values)
+	for k, v := range values {
+		assert.NotContains(t, k+v, secretValue)
+	}
+}
+
+func serverInfoWith(t *testing.T, routes map[string]func(http.ResponseWriter)) (map[string]string, probeState, *fakeServer) {
+	s := newFakeServer(t, routes)
+	h, p := s.hostPort(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	values, state := newAPIFetcher().serverInfo(ctx, "http", h, []string{p})
+	return values, state, s
+}
+
+func TestServerInfoAllowlistAndSecrets(t *testing.T) {
+	values, state, s := serverInfoWith(t, map[string]func(http.ResponseWriter){"/server_info": body(200, serverInfoBody)})
+	assert.Equal(t, probeAvailable, state)
+	assert.Equal(t, map[string]string{
+		sgVersion: "0.5.22", sgModelPath: "Qwen/Qwen3-8B", "served_model_name": "qwen3", "tp_size": "2",
+		"pp_size": "1", "dp_size": "1", "dtype": "auto", "quantization": "none", "kv_cache_dtype": "auto",
+		"mem_fraction_static": "0.871", "chunked_prefill_size": "8192", "max_prefill_tokens": "16384",
+		"max_running_requests": "none", "context_length": "40960", "schedule_policy": "fcfs",
+		"disable_radix_cache": "false", "disable_cuda_graph": "false", "speculative_algorithm": "none",
+		"attention_backend": "fa3", "disaggregation_mode": "null",
+	}, values)
+	for k, v := range values {
+		assert.NotContains(t, k+v, secretValue)
+	}
+	require.Len(t, s.reqs(), 1)
+	assert.Empty(t, s.reqs()[0].header.Get("Authorization"))
+}
+
+func TestServerInfoFallbackAnd401(t *testing.T) {
+	values, state, s := serverInfoWith(t, map[string]func(http.ResponseWriter){
+		"/get_server_info": body(200, `{"version":"0.4.6","tp_size":1}`)})
+	assert.Equal(t, probeAvailable, state)
+	assert.Equal(t, map[string]string{sgVersion: "0.4.6", "tp_size": "1"}, values)
+	assert.Len(t, s.reqs(), 2)
+
+	// a key is needed: not available, and /get_server_info is not tried
+	values, state, s = serverInfoWith(t, map[string]func(http.ResponseWriter){
+		"/server_info": body(401, `{"error":"Unauthorized"}`), "/get_server_info": body(200, `{"version":"0.5.22"}`)})
+	assert.Equal(t, probeUnavailable, state)
+	assert.Nil(t, values)
+	assert.Len(t, s.reqs(), 1)
+
+	_, state, _ = serverInfoWith(t, map[string]func(http.ResponseWriter){"*": body(200, promText)})
+	assert.Equal(t, probeUnavailable, state)
+	_, state, _ = serverInfoWith(t, map[string]func(http.ResponseWriter){
+		"/server_info": body(200, `{"version":"0.5.22","pad":"`+strings.Repeat("x", maxServerInfoBytes)+`"}`)})
+	assert.Equal(t, probeUnavailable, state)
+}
+
+// TestSGLangSecretsNeverReachRecordOrLog runs the processor against a fake SGLang
+// server with debug logs on: no secret of /server_info reaches an attribute or a log.
+func TestSGLangSecretsNeverReachRecordOrLog(t *testing.T) {
+	s := newFakeServer(t, map[string]func(http.ResponseWriter){"/server_info": body(200, serverInfoBody)})
+	host, port := s.hostPort(t)
+	core, logs := observer.New(zapcore.DebugLevel)
+	pod := enginePod("uid-sec", engineSGLang, containerSpec{
+		Command: []string{"sglang", "serve", "Qwen/Qwen3-8B", "--api-key", secretValue}})
+	p := newTestProcessorWithLogger(t, zap.New(core), newAPIFetcher(), &fakeLookup{pods: map[string]podView{host: pod}},
+		func(c *Config) {
+			c.Engine, c.Shapes, c.ResourceIdentity = engineSGLang, []string{shapeAnchor, shapeInfo}, true
+		})
+
+	out := process(t, p, scrape(host, port, gauge("sglang:num_running_reqs", nil)))
+	anchor := dpAttrs(t, out, "sglang:num_running_reqs")
+	assert.Equal(t, "0.5.22", anchor[keyEngineVersion])
+	assert.Equal(t, "fa3", anchor["sglang.effective.attention_backend"])
+
+	raw, err := (&pmetric.JSONMarshaler{}).MarshalMetrics(out)
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), secretValue)
+	require.NotZero(t, logs.Len())
+	for _, e := range logs.All() {
+		assert.NotContains(t, e.Message, secretValue)
+		for k, v := range e.ContextMap() {
+			assert.NotContains(t, k+fmt.Sprint(v), secretValue)
+		}
+	}
 }

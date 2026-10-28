@@ -1,13 +1,14 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT
 
-package vllmconfig
+package engineconfig
 
 import (
 	"bufio"
 	"encoding/json"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -86,7 +87,7 @@ func TestParserGolden(t *testing.T) {
 	agreeTruth, agreePython, total := 0, 0, 0
 	var mismatches []string
 	for _, r := range rows {
-		res := parseContainerArgs(r.spec())
+		res := parseContainerArgs(r.spec(), engineVLLM)
 		injected := map[string]bool{}
 		for _, f := range r.Injected {
 			injected[f] = true
@@ -121,7 +122,7 @@ func TestParserGolden(t *testing.T) {
 
 func parseArgs(t *testing.T, c containerSpec) map[string]string {
 	t.Helper()
-	res := parseContainerArgs(c)
+	res := parseContainerArgs(c, engineVLLM)
 	out := map[string]string{}
 	for _, f := range append(goldenFields, valGPUMemoryUtilization) {
 		out[f] = statusString(res, f)
@@ -231,6 +232,147 @@ func TestParserRules(t *testing.T) {
 				assert.Equal(t, v, got[k], k)
 			}
 		})
+	}
+}
+
+func TestParserSGLang(t *testing.T) {
+	tests := []struct {
+		name  string
+		spec  containerSpec
+		want  map[string]string
+		phase string
+		group string
+	}{
+		{
+			name: "sglang serve with a positional model, aliases, prefixes, store_true and human ints",
+			spec: containerSpec{
+				Command: []string{"sglang", "serve", "Qwen/Qwen3-8B"},
+				Args: []string{"--tensor-parallel-size", "4", "--dp", "2", "--mem-fraction-static=0.88",
+					"--context-length", "32Ki", "--max-total-tokens", "1.5M", "--disable-radix-cache",
+					"--model-type", "llm", "--quantization", "fp8"},
+			},
+			want: map[string]string{
+				sgModelPath: "Qwen/Qwen3-8B", "tp_size": "4", "dp_size": "2", "mem_fraction_static": "0.88",
+				"context_length": "32768", "max_total_tokens": "1500000", "disable_radix_cache": "true",
+				"quantization": "fp8", "pp_size": "default", "dtype": "default", "disaggregation_mode": "default",
+			},
+			phase: phaseUnified,
+		},
+		{
+			name: "python3 -m sglang.launch_server in a shell, with the role flag",
+			spec: containerSpec{
+				Command: []string{"/bin/bash", "-c"},
+				Args: []string{"set -e\nexec python3 -m sglang.launch_server --model-path $(MODEL) --tp-size 8 " +
+					"--disaggregation-mode decode --disable-cuda-graph --lora-paths a=/x b=/y --host 0.0.0.0 " +
+					"--nnodes 2 --node-rank 1"},
+				Env: []envVar{{Name: "MODEL", Value: "deepseek-ai/DeepSeek-V3"}},
+			},
+			want: map[string]string{sgModelPath: "deepseek-ai/DeepSeek-V3", "tp_size": "8",
+				"disaggregation_mode": "decode", "disable_cuda_graph": "true", "speculative_algorithm": "default"},
+			phase: phaseDecode,
+			group: groupWorker,
+		},
+		{
+			name:  "role switch",
+			spec:  containerSpec{Command: []string{"sglang", "serve", "m", "--disaggregation-mode", "prefill", "--enable-pd-role-switch"}},
+			want:  map[string]string{sgEnablePDRoleSwitch: "true"},
+			phase: phaseDynamic,
+		},
+		{
+			name:  "the Dynamo SGLang launcher decides only by its flag",
+			spec:  containerSpec{Command: []string{"python3", "-m", "dynamo.sglang", "--model-path", "m", "--tp-size", "2"}},
+			want:  map[string]string{sgModelPath: "m", "tp_size": "2"},
+			phase: "",
+		},
+		{
+			name:  "the Dynamo SGLang launcher with a prefill mode",
+			spec:  containerSpec{Command: []string{"python3", "-m", "dynamo.sglang", "--model-path", "m", "--disaggregation-mode", "prefill"}},
+			want:  map[string]string{sgModelPath: "m"},
+			phase: phasePrefill,
+		},
+		{
+			name: "--config may set the values that the argv does not set",
+			spec: containerSpec{Command: []string{"sglang", "serve", "--config", "/etc/sglang.yaml", "--tp-size", "2"}},
+			want: map[string]string{"tp_size": "2", sgModelPath: "unknown", "dtype": "unknown"},
+		},
+		{
+			name:  "null disaggregation mode is unified",
+			spec:  containerSpec{Command: []string{"sglang", "serve", "--model-path", "m", "--disaggregation-mode", "null"}},
+			want:  map[string]string{"disaggregation_mode": "null"},
+			phase: phaseUnified,
+		},
+		{
+			name: "a vLLM command line is not SGLang's",
+			spec: containerSpec{Command: []string{"vllm", "serve", "m", "-tp", "2"}},
+			want: map[string]string{sgModelPath: "unknown", "tp_size": "unknown"},
+		},
+		{
+			name: "args only: an SGLang image does not start the server by itself",
+			spec: containerSpec{Image: "lmsysorg/sglang:v0.5.22", Args: []string{"--model-path", "m"}},
+			want: map[string]string{sgModelPath: "unknown"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := parseContainerArgs(tt.spec, engineSGLang)
+			for k, v := range tt.want {
+				assert.Equal(t, v, statusString(res, k), k)
+			}
+			assert.Equal(t, tt.phase, res.phase)
+			assert.Equal(t, tt.group, res.group)
+		})
+	}
+	// every SGLang value that the args give is an option destination
+	dests := map[string]bool{}
+	for _, o := range sglangOptions {
+		dests[o.dest] = true
+	}
+	for _, name := range sglangValues {
+		if name != sgVersion {
+			assert.True(t, dests[name], name)
+		}
+	}
+}
+
+func TestFlagPhaseAndGroupVLLM(t *testing.T) {
+	tests := []struct{ args, phase, group string }{
+		{`--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'`, phasePrefill, ""},
+		{`--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'`, phaseDecode, ""},
+		// llm-d runs kv_both on both sides, so it does not decide
+		{`--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'`, "", ""},
+		{`--kv-transfer-config.kv_role kv_consumer`, phaseDecode, ""},
+		{`--kv-transfer-config $(KV_CONFIG)`, "", ""},
+		{`--ec-transfer-config '{"ec_connector":"ECSharedStorageConnector","ec_role":"ec_producer"}'`, phaseEncode, ""},
+		{`--ec-transfer-config '{"ec_role":"ec_consumer"}'`, phaseUnified, ""},
+		{``, phaseUnified, ""},
+		{`$EXTRA_ARGS`, "", ""},
+		{`--headless`, phaseUnified, groupWorker},
+		{`--nnodes 2 --node-rank 1`, phaseUnified, groupWorker},
+		{`--nnodes 2`, phaseUnified, groupLeader},
+		{`-n 2 -r 0`, phaseUnified, groupLeader},
+		{`--nnodes 1`, phaseUnified, ""},
+		{`--nnodes $(NODES)`, phaseUnified, ""},
+	}
+	for _, tt := range tests {
+		spec := containerSpec{Command: []string{"sh", "-c", "vllm serve m " + tt.args},
+			Env: []envVar{{Name: "KV_CONFIG", FromSource: true}, {Name: "NODES", FromSource: true}}}
+		res := parseContainerArgs(spec, engineVLLM)
+		require.True(t, res.found, tt.args)
+		assert.Equal(t, tt.phase, res.phase, tt.args)
+		assert.Equal(t, tt.group, res.group, tt.args)
+	}
+
+	// the Dynamo vLLM launcher: its own --disaggregation-mode, no transfer config
+	for args, want := range map[string]string{
+		"--model m --disaggregation-mode prefill": phasePrefill,
+		"--model m --disaggregation-mode agg":     phaseUnified,
+		"--model m --disaggregation-mode encode":  phaseEncode,
+		"--model m":                               "",
+	} {
+		res := parseContainerArgs(containerSpec{Command: append([]string{"python3", "-m", "dynamo.vllm"}, strings.Fields(args)...)}, engineVLLM)
+		require.True(t, res.found, args)
+		assert.Equal(t, want, res.phase, args)
+		assert.Equal(t, fieldValue{Status: statusSet, Value: "m"}, res.fields[valModel], args)
 	}
 }
 

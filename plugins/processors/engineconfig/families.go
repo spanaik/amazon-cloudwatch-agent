@@ -1,14 +1,15 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT
 
-package vllmconfig
+package engineconfig
 
 import "strings"
 
-// The attribution map: each vllm:* family gets only the engine values that
-// explain it (design note "Attribution of vLLM Engine Configuration", section 4,
-// plus the V0-era names). Names are without the "vllm:" prefix. Counters match
-// with and without "_total"; histograms come without "_bucket".
+// The attribution map of the per_family shape: each vllm:* family gets only the
+// engine values that explain it (design note "Attribution of vLLM Engine
+// Configuration", section 4, plus the V0-era names). Names are without the
+// "vllm:" prefix. Counters match with and without "_total"; histograms come
+// without "_bucket".
 
 const vllmMetricPrefix = "vllm:"
 

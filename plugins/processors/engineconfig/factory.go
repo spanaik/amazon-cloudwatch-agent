@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT
 
-package vllmconfig
+package engineconfig
 
 import (
 	"context"
@@ -17,12 +17,15 @@ import (
 const (
 	stability = component.StabilityLevelDevelopment
 
-	defaultRefreshInterval = 10 * time.Minute
 	defaultTimeout         = 3 * time.Second
+	defaultRefreshInterval = 10 * time.Minute
+	defaultRetryInterval   = time.Minute
+	defaultLogRoot         = "/var/log/pods"
+	defaultLogReadLimit    = 1 << 20
 )
 
 var (
-	TypeStr, _            = component.NewType("vllmconfig")
+	TypeStr, _            = component.NewType("engineconfig")
 	processorCapabilities = consumer.Capabilities{MutatesData: true}
 )
 
@@ -33,10 +36,15 @@ func NewFactory() processor.Factory {
 		processor.WithMetrics(createMetricsProcessor, stability))
 }
 
+// createDefaultConfig has no engine: the engine is required.
 func createDefaultConfig() component.Config {
 	return &Config{
-		RefreshInterval: defaultRefreshInterval,
 		Timeout:         defaultTimeout,
+		RefreshInterval: defaultRefreshInterval,
+		RetryInterval:   defaultRetryInterval,
+		Shapes:          []string{shapeAnchor},
+		LogRoot:         defaultLogRoot,
+		LogReadLimit:    defaultLogReadLimit,
 	}
 }
 
@@ -51,7 +59,10 @@ func createMetricsProcessor(
 		return nil, fmt.Errorf("configuration parsing error")
 	}
 
-	p := newVLLMConfigProcessor(processorConfig, set.Logger)
+	p, err := newEngineConfigProcessor(processorConfig, set.Logger)
+	if err != nil {
+		return nil, err
+	}
 
 	return processorhelper.NewMetrics(
 		ctx,

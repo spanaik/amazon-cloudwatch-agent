@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT
 
-package vllmconfig
+package engineconfig
 
 import (
 	"regexp"
@@ -26,15 +26,26 @@ type envVar struct {
 }
 
 type invocation struct {
-	kind string // "vllm serve" | "api_server" | "legacy_api_server"
+	// "vllm serve" | "api_server" | "legacy_api_server" | "sglang serve" |
+	// "sglang launch_server" | "dynamo vllm" | "dynamo sglang"
+	kind string
 	args []word
 }
 
+func engineOfKind(kind string) string {
+	if strings.HasSuffix(kind, "sglang") || strings.HasPrefix(kind, "sglang ") {
+		return engineSGLang
+	}
+	return engineVLLM
+}
+
 // argsResult is what the pod args say about each value. found=false means that no
-// vLLM server command line was found, so the args cannot tell any value.
+// server command line of the engine was found, so the args cannot tell any value.
 type argsResult struct {
 	found  bool
 	fields map[string]fieldValue
+	phase  string // the phase that the engine flags set, if any
+	group  string // the group role that the engine flags set, if any
 }
 
 var (
@@ -175,15 +186,16 @@ func stripWrappers(words []word) []word {
 	return w
 }
 
-// matchInvocation reports whether words start a vLLM server.
+// matchInvocation reports whether words start a vLLM or an SGLang server, or a
+// Dynamo launcher of one.
 func matchInvocation(words []word) (string, []word, bool) {
 	if len(words) == 0 || words[0].opaque {
 		return "", nil, false
 	}
 	b := basename(words[0].s)
-	if b == "vllm" {
+	if b == "vllm" || b == "sglang" {
 		if len(words) > 1 && !words[1].opaque && words[1].s == "serve" {
-			return "vllm serve", words[2:], true
+			return b + " serve", words[2:], true
 		}
 		return "", nil, false
 	}
@@ -231,6 +243,10 @@ func matchInvocation(words []word) (string, []word, bool) {
 		return "legacy_api_server", rest, true
 	case (mod == "vllm.entrypoints.cli.main" || mod == "vllm") && len(rest) > 0 && !rest[0].opaque && rest[0].s == "serve":
 		return "vllm serve", rest[1:], true
+	case mod == "sglang.launch_server":
+		return "sglang launch_server", rest, true
+	case mod == "dynamo.vllm" || mod == "dynamo.sglang":
+		return "dynamo " + mod[len("dynamo."):], rest, true
 	}
 	return "", nil, false
 }
@@ -326,8 +342,8 @@ func handleWords(words []word, ctx *shellCtx, found *[]invocation, via string) {
 	}
 }
 
-// imageEntrypoint tells how an args-only container starts: "vllm serve" for the
-// official vllm-openai images, "command" for images that run the args as a
+// imageEntrypoint tells how an args-only vLLM container starts: "vllm serve" for
+// the official vllm-openai images, "command" for images that run the args as a
 // command (NGC), "assumed" for other images whose name contains vllm, or "".
 func imageEntrypoint(image string) string {
 	fields := strings.Fields(strings.Trim(strings.TrimSpace(image), `"`))
@@ -346,8 +362,10 @@ func imageEntrypoint(image string) string {
 	return ""
 }
 
-// parseContainerArgs reads the vLLM engine flags from one container spec.
-func parseContainerArgs(c containerSpec) argsResult {
+// parseContainerArgs reads the engine flags from one container spec. SGLang
+// images do not start the server by themselves, so an args-only SGLang
+// container must hold the whole command line.
+func parseContainerArgs(c containerSpec, engine string) argsResult {
 	envmap := buildEnv(c.Env, c.EnvFrom)
 	cmd := make([]string, len(c.Command))
 	for i, s := range c.Command {
@@ -365,10 +383,13 @@ func parseContainerArgs(c containerSpec) argsResult {
 		if len(arg) == 0 {
 			return argsResult{}
 		}
-		ep := imageEntrypoint(c.Image)
+		ep := ""
+		if engine == engineVLLM {
+			ep = imageEntrypoint(c.Image)
+		}
 		b0 := basename(arg[0])
 		switch {
-		case shells[b0] || b0 == "vllm" || pythonRE.MatchString(b0):
+		case shells[b0] || b0 == engine || pythonRE.MatchString(b0):
 			argv = arg // args hold the whole command line
 		case ep == "":
 			return argsResult{}
@@ -384,15 +405,39 @@ func parseContainerArgs(c containerSpec) argsResult {
 		}
 	}
 
-	var found []invocation
+	var all, found []invocation
 	ctx := &shellCtx{envmap: envmap, vars: map[string]string{}}
-	handleWords(strWords(argv), ctx, &found, "exec")
+	handleWords(strWords(argv), ctx, &all, "exec")
+	for _, inv := range all {
+		if engineOfKind(inv.kind) == engine {
+			found = append(found, inv)
+		}
+	}
 	if len(found) == 0 {
 		return argsResult{}
 	}
+	// several command lines (for example in if/else branches) must agree
 	var results []map[string]fieldValue
-	for _, inv := range found {
-		results = append(results, fieldValues(inv.kind, vllmParse(inv.kind, inv.args)))
+	phase, group := "", ""
+	for i, inv := range found {
+		var pr parseResult
+		if engine == engineSGLang {
+			pr = sglangParse(inv.kind, inv.args)
+			results = append(results, sglangFieldValues(pr))
+		} else {
+			pr = vllmParse(inv.kind, inv.args)
+			results = append(results, vllmFieldValues(inv.kind, pr))
+		}
+		p, g := flagPhase(inv.kind, pr), flagGroup(pr)
+		if i == 0 {
+			phase, group = p, g
+		}
+		if p != phase {
+			phase = ""
+		}
+		if g != group {
+			group = ""
+		}
 	}
 	fields := results[0]
 	if len(results) > 1 {
@@ -405,21 +450,13 @@ func parseContainerArgs(c containerSpec) argsResult {
 			}
 		}
 	}
-	return argsResult{found: true, fields: fields}
+	return argsResult{found: true, fields: fields, phase: phase, group: group}
 }
 
-// mentionsVLLM reports whether the image or the command line names vLLM.
-func mentionsVLLM(c containerSpec) bool {
-	if strings.Contains(strings.ToLower(c.Image), "vllm") {
-		return true
-	}
-	for _, s := range c.Command {
-		if strings.Contains(strings.ToLower(s), "vllm") {
-			return true
-		}
-	}
-	for _, s := range c.Args {
-		if strings.Contains(strings.ToLower(s), "vllm") {
+// mentionsEngine reports whether the image or the command line names the engine.
+func mentionsEngine(c containerSpec, engine string) bool {
+	for _, s := range append(append([]string{c.Image}, c.Command...), c.Args...) {
+		if strings.Contains(strings.ToLower(s), engine) {
 			return true
 		}
 	}

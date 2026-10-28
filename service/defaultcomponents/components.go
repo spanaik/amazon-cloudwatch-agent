@@ -90,10 +90,10 @@ import (
 	"github.com/aws/amazon-cloudwatch-agent/plugins/processors/awsentity"
 	"github.com/aws/amazon-cloudwatch-agent/plugins/processors/awsneuron"
 	"github.com/aws/amazon-cloudwatch-agent/plugins/processors/ec2tagger"
+	"github.com/aws/amazon-cloudwatch-agent/plugins/processors/engineconfig"
 	"github.com/aws/amazon-cloudwatch-agent/plugins/processors/gpuattributes"
 	"github.com/aws/amazon-cloudwatch-agent/plugins/processors/kueueattributes"
 	"github.com/aws/amazon-cloudwatch-agent/plugins/processors/nodemetadataenricher"
-	"github.com/aws/amazon-cloudwatch-agent/plugins/processors/vllmconfig"
 	"github.com/aws/amazon-cloudwatch-agent/processor/rollupprocessor"
 	"github.com/aws/amazon-cloudwatch-agent/receiver/awsnvmereceiver"
 	"github.com/aws/amazon-cloudwatch-agent/receiver/systemmetricsreceiver"
@@ -146,6 +146,7 @@ func Factories() (otelcol.Factories, error) {
 		deltatocumulativeprocessor.NewFactory(),
 		deltatorateprocessor.NewFactory(),
 		ec2tagger.NewFactory(),
+		engineconfig.NewFactory(),
 		filterprocessor.NewFactory(),
 		gpuattributes.NewFactory(),
 		kueueattributes.NewFactory(),
@@ -164,7 +165,6 @@ func Factories() (otelcol.Factories, error) {
 		spanprocessor.NewFactory(),
 		tailsamplingprocessor.NewFactory(),
 		transformprocessor.NewFactory(),
-		vllmconfig.NewFactory(),
 	); err != nil {
 		return otelcol.Factories{}, err
 	}

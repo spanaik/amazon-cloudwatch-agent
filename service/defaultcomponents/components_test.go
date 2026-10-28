@@ -66,6 +66,7 @@ func TestComponents(t *testing.T) {
 		"deltatocumulative",
 		"deltatorate",
 		"ec2tagger",
+		"engineconfig",
 		"filter",
 		"gpuattributes",
 		"groupbyattrs",
@@ -86,7 +87,6 @@ func TestComponents(t *testing.T) {
 		"span",
 		"tail_sampling",
 		"transform",
-		"vllmconfig",
 	}
 	gotProcessors := collections.MapSlice(maps.Keys(factories.Processors), component.Type.String)
 	assert.Equal(t, len(wantProcessors), len(gotProcessors))

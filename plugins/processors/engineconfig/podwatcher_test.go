@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT
 
-package vllmconfig
+package engineconfig
 
 import (
 	"context"
@@ -26,11 +26,15 @@ import (
 const secretValue = "s3cr3t-value-never-cached"
 
 func testPod(name, uid, ip string, port int32) *corev1.Pod {
+	isController := true
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name, Namespace: "inference", UID: types.UID(uid),
-			Annotations: map[string]string{"note": secretValue},
-			Labels:      map[string]string{"app": "vllm"},
+			Annotations: map[string]string{"note": secretValue, lwsSizeAnnotation: "2"},
+			Labels: map[string]string{"app": "vllm", "team": secretValue, podTemplateHashLabel: "5dbcb77dd",
+				"llm-d.ai/role": "prefill"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: "vllm-demo-5dbcb77dd", UID: "rs-uid-" + secretValue, Controller: &isController}},
 		},
 		Spec: corev1.PodSpec{
 			NodeName: "node-a",
@@ -53,13 +57,13 @@ func testPod(name, uid, ip string, port int32) *corev1.Pod {
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning, PodIP: ip, HostIP: "192.168.0.1",
-			ContainerStatuses: []corev1.ContainerStatus{{Name: "vllm", RestartCount: 2}},
+			ContainerStatuses: []corev1.ContainerStatus{{Name: "sidecar", RestartCount: 5}, {Name: "vllm", RestartCount: 2}},
 		},
 	}
 }
 
 func startWatcher(t *testing.T, client kubernetes.Interface, envMap map[string]string) *podWatcher {
-	w, err := newPodWatcher(client, "node-a", envMap, zap.NewNop(), nil)
+	w, err := newPodWatcher(client, "node-a", engineVLLM, envMap, zap.NewNop(), nil)
 	require.NoError(t, err)
 	stop := make(chan struct{})
 	t.Cleanup(func() { close(stop) })
@@ -83,7 +87,10 @@ func TestPodWatcherLookupAndMinimize(t *testing.T) {
 	v, ok := w.lookup(scrapeTarget{host: "10.0.0.5", port: "8000"})
 	require.True(t, ok)
 	assert.Equal(t, types.UID("uid-a"), v.uid)
-	assert.Equal(t, int64(2), v.restarts)
+	assert.Equal(t, map[string]int32{"sidecar": 5, "vllm": 2}, v.restarts)
+	assert.Equal(t, map[string]string{podTemplateHashLabel: "5dbcb77dd", "llm-d.ai/role": "prefill"}, v.labels)
+	assert.Equal(t, map[string]string{lwsSizeAnnotation: "2"}, v.annotations)
+	assert.Equal(t, []owner{{Kind: "ReplicaSet", Name: "vllm-demo-5dbcb77dd"}}, v.owners)
 	c, ok := v.scrapedContainer(scrapeTarget{port: "8000"})
 	require.True(t, ok)
 	assert.Equal(t, "vllm", c.Name)
@@ -92,14 +99,16 @@ func TestPodWatcherLookupAndMinimize(t *testing.T) {
 	assert.Equal(t, fieldValue{Status: statusSet, Value: "4096"}, c.Args[valMaxModelLen])
 	assert.Equal(t, fieldValue{Status: statusSet, Value: "999"}, c.Env[valMaxModelLen])
 
-	// the cached object has no command, args, env, annotations or labels of the pod,
-	// and no raw value anywhere
+	// the cached object has no command, args or env of the pod, only the
+	// allowlisted labels and annotations, owners by kind and name, and no raw
+	// value anywhere
 	objs := w.informer.GetIndexer().List()
 	require.Len(t, objs, 1)
 	cached := objs[0].(*corev1.Pod)
 	assert.Empty(t, cached.Spec.Containers)
-	assert.Empty(t, cached.Labels)
-	assert.Len(t, cached.Annotations, 1)
+	assert.Len(t, cached.Labels, 2)
+	assert.Len(t, cached.Annotations, 2)
+	assert.Equal(t, []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "vllm-demo-5dbcb77dd"}}, cached.OwnerReferences)
 	raw, err := json.Marshal(cached)
 	require.NoError(t, err)
 	assert.NotContains(t, string(raw), secretValue)
@@ -118,7 +127,7 @@ func TestPodWatcherLookupAndMinimize(t *testing.T) {
 func TestMinimizePodIgnoresForgedAnnotation(t *testing.T) {
 	pod := testPod("p", "u", "10.0.0.1", 8000)
 	pod.Annotations[podInfoAnnotation] = `{"c":[{"n":"vllm","a":{"dtype":{"s":2,"v":"forged"}}}]}`
-	out, err := minimizePod(nil)(pod)
+	out, err := minimizePod(engineVLLM, nil)(pod)
 	require.NoError(t, err)
 	info := decodePodInfo(out.(*corev1.Pod))
 	require.Len(t, info.Containers, 2)
@@ -126,15 +135,35 @@ func TestMinimizePodIgnoresForgedAnnotation(t *testing.T) {
 
 	// a pod object from the API server is never trusted as minimized
 	assert.Empty(t, decodePodInfo(pod).Containers)
+	assert.Nil(t, viewOf(pod).labels)
 	// the transform is idempotent
-	again, err := minimizePod(nil)(out)
+	again, err := minimizePod(engineVLLM, nil)(out)
 	require.NoError(t, err)
 	assert.Same(t, out, again)
 }
 
+func TestMinimizePodSGLang(t *testing.T) {
+	pod := testPod("p", "u", "10.0.0.1", 30000)
+	pod.Spec.Containers[1] = corev1.Container{Name: "sglang", Image: "lmsysorg/sglang:v0.5.22",
+		Command: []string{"sglang", "serve", "Qwen/Qwen3-8B", "--tp-size", "4", "--disaggregation-mode", "decode",
+			"--api-key", secretValue}}
+	out, err := minimizePod(engineSGLang, map[string]string{"MAX_MODEL_LEN": valMaxModelLen})(pod)
+	require.NoError(t, err)
+	info := decodePodInfo(out.(*corev1.Pod))
+	c := info.Containers[1]
+	assert.True(t, c.Engine)
+	assert.Equal(t, phaseDecode, c.Phase)
+	assert.Equal(t, "0.5.22", c.Image)
+	assert.Equal(t, fieldValue{Status: statusSet, Value: "4"}, c.Args["tp_size"])
+	assert.Equal(t, fieldValue{Status: statusSet, Value: "Qwen/Qwen3-8B"}, c.Args[sgModelPath])
+	assert.Nil(t, c.Env, "the env contract is vllm only")
+	raw, _ := json.Marshal(out)
+	assert.NotContains(t, string(raw), secretValue)
+}
+
 func TestChoosePodHostNetwork(t *testing.T) {
-	a, _ := minimizePod(nil)(testPod("a", "ua", "192.168.0.1", 8000))
-	b, _ := minimizePod(nil)(testPod("b", "ub", "192.168.0.1", 8001))
+	a, _ := minimizePod(engineVLLM, nil)(testPod("a", "ua", "192.168.0.1", 8000))
+	b, _ := minimizePod(engineVLLM, nil)(testPod("b", "ub", "192.168.0.1", 8001))
 	pods := []*corev1.Pod{a.(*corev1.Pod), b.(*corev1.Pod)}
 	assert.Equal(t, types.UID("ub"), choosePod(pods, scrapeTarget{port: "8001"}).UID)
 	assert.Nil(t, choosePod(pods, scrapeTarget{port: "7777"}))
@@ -152,8 +181,9 @@ func TestProcessorEndToEnd(t *testing.T) {
 	client := fake.NewClientset(pod)
 
 	cfg := NewFactory().CreateDefaultConfig().(*Config)
-	cfg.NodeName = "node-a"
-	p := newVLLMConfigProcessor(cfg, zap.NewNop())
+	cfg.Engine, cfg.NodeName, cfg.EmitWorkload = engineVLLM, "node-a", true
+	p, err := newEngineConfigProcessor(cfg, zap.NewNop())
+	require.NoError(t, err)
 	p.newClient = func() (kubernetes.Interface, error) { return client, nil }
 	require.NoError(t, p.start(context.Background(), componenttest.NewNopHost()))
 	defer func() { require.NoError(t, p.shutdown(context.Background())) }()
@@ -162,12 +192,17 @@ func TestProcessorEndToEnd(t *testing.T) {
 	start := time.Now()
 	out := process(t, p, md)
 	assert.Less(t, time.Since(start), cfg.Timeout)
-	res := out.ResourceMetrics().At(0).Resource().Attributes().AsRaw()
-	assert.Equal(t, "0.11.2", res["vllm.config.version"])
-	assert.Equal(t, "Qwen/Qwen2.5-0.5B-Instruct", res["vllm.config.model"])
-	assert.Equal(t, "V1", res["vllm.config.engine"])
-	assert.Equal(t, "2", dpAttrs(t, out, "vllm:time_to_first_token_seconds")["vllm.config.tensor_parallel_size"])
-	assert.Equal(t, "2048", dpAttrs(t, out, "vllm:num_requests_running")["vllm.config.max_model_len"])
+	anchor := dpAttrs(t, out, "vllm:num_requests_running")
+	assert.Equal(t, "0.11.2", anchor[keyEngineVersion])
+	assert.Equal(t, "V1", anchor[keyEngineGeneration])
+	// no KV transfer config: the flags say unified, over the llm-d label
+	assert.Equal(t, phaseUnified, anchor[keyEngineRole])
+	assert.Equal(t, "Qwen/Qwen2.5-0.5B-Instruct", anchor[keyRequestModel])
+	assert.Equal(t, "Deployment", anchor[keyWorkloadType])
+	assert.Equal(t, "vllm-demo", anchor[keyWorkloadName])
+	assert.Equal(t, "2", anchor["vllm.config.tensor_parallel_size"])
+	assert.Equal(t, "2048", anchor["vllm.effective.max_model_len"])
+	assert.Equal(t, "4096", anchor["vllm.config.max_model_len"])
 	for _, r := range api.reqs() {
 		assert.Empty(t, r.header.Get("Authorization"))
 		assert.True(t, strings.HasPrefix(r.path, "/v"))

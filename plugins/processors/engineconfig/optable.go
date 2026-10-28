@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT
 
-package vllmconfig
+package engineconfig
 
 // vllmOptions is the vLLM v0.32.0 option table (EngineArgs.add_cli_args and
 // make_arg_parser), taken from the reference parser parse_vllm.py, plus a few flags

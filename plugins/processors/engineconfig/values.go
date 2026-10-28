@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT
 
-package vllmconfig
+package engineconfig
 
 import (
 	"regexp"
@@ -9,49 +9,18 @@ import (
 	"strings"
 )
 
-// Value names. The attribute key is attrPrefix + name.
-const (
-	attrPrefix = "vllm.config."
+// maxValueLength bounds every attribute value.
+const maxValueLength = 256
 
-	// identity values, on the resource
-	valVersion = "version"
-	valModel   = "model"
-	valEngine  = "engine"
-
-	// data point values
-	valTensorParallelSize   = "tensor_parallel_size"
-	valPipelineParallelSize = "pipeline_parallel_size"
-	valDataParallelSize     = "data_parallel_size"
-	valDtype                = "dtype"
-	valQuantization         = "quantization"
-	valEnforceEager         = "enforce_eager"
-	valSpeculativeMethod    = "speculative_method"
-	valNumSpeculativeTokens = "num_speculative_tokens"
-	valMaxNumSeqs           = "max_num_seqs"
-	valMaxNumBatchedTokens  = "max_num_batched_tokens"
-	valEnableChunkedPrefill = "enable_chunked_prefill"
-	valEnablePrefixCaching  = "enable_prefix_caching"
-	valGPUMemoryUtilization = "gpu_memory_utilization"
-	valKVCacheDtype         = "kv_cache_dtype"
-	valMaxModelLen          = "max_model_len"
-
-	// defaultValue is the value of a setting that the customer did not set.
-	defaultValue = "default"
-
-	// maxValueLength bounds every attribute value.
-	maxValueLength = 256
-)
-
-var resourceValues = []string{valVersion, valModel, valEngine}
-
-// envMappable lists the values that an env contract (env_map) can give.
-var envMappable = map[string]bool{
-	valModel: true, valTensorParallelSize: true, valPipelineParallelSize: true, valDataParallelSize: true,
-	valDtype: true, valQuantization: true, valEnforceEager: true, valSpeculativeMethod: true,
-	valNumSpeculativeTokens: true, valMaxNumSeqs: true, valMaxNumBatchedTokens: true,
-	valEnableChunkedPrefill: true, valEnablePrefixCaching: true, valGPUMemoryUtilization: true,
-	valKVCacheDtype: true, valMaxModelLen: true,
-}
+// envMappable lists the values that an env contract (env_map) can give: the
+// configured vLLM values.
+var envMappable = func() map[string]bool {
+	out := map[string]bool{}
+	for _, name := range vllmConfigured {
+		out[name] = true
+	}
+	return out
+}()
 
 // envConverters normalizes env contract values like the matching vLLM flag.
 var envConverters = map[string]converter{
@@ -81,26 +50,28 @@ func convBool(raw string) (string, bool, bool) {
 	return "", false, false
 }
 
-// pick returns the value of the first source that sets it. A source that may set
-// it but whose value is not literal makes the value unknown (absent). Otherwise,
-// if a source says "not set", the value is "default". If no source can tell, the
-// value is absent.
-func pick(sources ...fieldValue) (string, bool) {
-	sawDefault, sawUnknown := false, false
-	for _, s := range sources {
+// pick returns the value of the first source that sets it, and the index of the
+// source that decides. A source that may set it but whose value is not literal
+// makes the value unknown (absent). Otherwise, if a source says "not set", the
+// value is "default". If no source can tell, the value is absent.
+func pick(sources ...fieldValue) (string, int, bool) {
+	firstDefault, sawUnknown := -1, false
+	for i, s := range sources {
 		switch s.Status {
 		case statusSet:
-			return s.Value, true
+			return s.Value, i, true
 		case statusUnknown:
 			sawUnknown = true
 		case statusDefault:
-			sawDefault = true
+			if firstDefault < 0 {
+				firstDefault = i
+			}
 		}
 	}
-	if sawUnknown || !sawDefault {
-		return "", false
+	if sawUnknown || firstDefault < 0 {
+		return "", 0, false
 	}
-	return defaultValue, true
+	return defaultValue, firstDefault, true
 }
 
 func set(v string) fieldValue { return fieldValue{Status: statusSet, Value: v} }
@@ -173,7 +144,9 @@ func useV1Env(env []envVar, envFrom bool) string {
 
 var (
 	versionRE     = regexp.MustCompile(`^[0-9]+\.[0-9]+(\.[0-9]+)?[0-9A-Za-z.+\-]*$`)
-	versionPartRE = regexp.MustCompile(`^([0-9]+)\.([0-9]+)`)
+	versionPartRE = regexp.MustCompile(`^([0-9]+)\.([0-9]+)(?:\.([0-9]+))?`)
+	// imageTagRE takes the release out of an image tag: v0.5.22-cu130 gives 0.5.22
+	imageTagRE = regexp.MustCompile(`^v?([0-9]+\.[0-9]+(?:\.[0-9]+)?(?:\.post[0-9]+)?)(?:$|[-_+])`)
 )
 
 // parseVersion returns the major and minor version.
@@ -187,6 +160,37 @@ func parseVersion(v string) (int, int, bool) {
 	return major, minor, err1 == nil && err2 == nil
 }
 
+// versionAtLeast reports whether version is at least want (major, minor, patch).
+func versionAtLeast(version string, want [3]int) bool {
+	m := versionPartRE.FindStringSubmatch(version)
+	if m == nil {
+		return false
+	}
+	for i, part := range m[1:] {
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			n = 0 // no patch part
+		}
+		if n != want[i] {
+			return n > want[i]
+		}
+	}
+	return true
+}
+
+// imageVersion gives the release in the tag of a container image, or "".
+func imageVersion(image string) string {
+	image, _, _ = strings.Cut(strings.TrimSpace(image), "@")
+	i := strings.LastIndexByte(image, ':')
+	if i < 0 || strings.Contains(image[i:], "/") {
+		return ""
+	}
+	if m := imageTagRE.FindStringSubmatch(image[i+1:]); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
 // v0OnlyFamilies exist only in the V0 engine.
 var v0OnlyFamilies = map[string]bool{
 	"vllm:num_requests_swapped":   true,
@@ -194,11 +198,10 @@ var v0OnlyFamilies = map[string]bool{
 	"vllm:time_in_queue_requests": true,
 }
 
-// deriveEngine gives "V0", "V1" or "" (unknown). From v0.11.0 the V0 engine is
-// gone. From v0.8.0 V1 is the default unless VLLM_USE_V1=0. Before v0.8.0 V0 is
-// the default unless VLLM_USE_V1=1. Without a version, a V0-only family in the
-// scrape means V0.
-func deriveEngine(version, useV1 string, v0Seen bool) string {
+// deriveGeneration gives "V0", "V1" or "" (unknown) from the version. From v0.11.0
+// the V0 engine is gone. From v0.8.0 V1 is the default unless VLLM_USE_V1=0.
+// Before v0.8.0 V0 is the default unless VLLM_USE_V1=1.
+func deriveGeneration(version, useV1 string) string {
 	if major, minor, ok := parseVersion(version); ok {
 		switch {
 		case major > 0 || minor >= 11:
@@ -219,10 +222,22 @@ func deriveEngine(version, useV1 string, v0Seen bool) string {
 			}
 		}
 	}
-	if v0Seen {
-		return "V0"
-	}
 	return ""
+}
+
+// effectiveValue normalizes an effective value that the engine prints the Python
+// way, like the converters do: True and False become true and false, and None
+// becomes none.
+func effectiveValue(raw string) (string, bool) {
+	switch raw {
+	case "True":
+		return "true", true
+	case "False":
+		return "false", true
+	case "None":
+		return noneValue, true
+	}
+	return raw, validValue(raw)
 }
 
 func validValue(v string) bool {

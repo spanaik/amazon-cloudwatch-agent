@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT
 
-package vllmconfig
+package engineconfig
 
 import (
 	"encoding/json"
@@ -11,9 +11,11 @@ import (
 	"strings"
 )
 
-// This file emulates vLLM's FlexibleArgumentParser and Python argparse on the argv
-// after `vllm serve` (or the api_server module). It is a port of the core of the
-// reference parser (parse_vllm.py, flag rules of vLLM v0.32.0).
+// This file emulates Python argparse on the argv after the server command: with
+// vLLM's FlexibleArgumentParser rules after `vllm serve` (or the api_server
+// module), a port of the core of the reference parser (parse_vllm.py, flag rules
+// of vLLM v0.32.0), and with plain argparse rules after `sglang serve` (or
+// sglang.launch_server).
 
 type nargsKind int
 
@@ -22,6 +24,7 @@ const (
 	nargsOne
 	nargsPlus
 	nargsOptional
+	nargsStar
 )
 
 type option struct {
@@ -85,18 +88,18 @@ var (
 // matchOption ports argparse._parse_optional and _get_option_tuples (Python 3.12).
 // It returns the kind ("" for a positional, "unknown", "ambiguous" or "opt"), the
 // option string and the explicit value after "=", if any.
-func matchOption(tok string) (string, string, *string) {
+func matchOption(opts map[string]option, tok string) (string, string, *string) {
 	if tok == "" || tok[0] != '-' || tok == "-" {
 		return "", "", nil
 	}
-	if _, ok := vllmOptions[tok]; ok {
+	if _, ok := opts[tok]; ok {
 		return "opt", tok, nil
 	}
 	if len(tok) == 1 {
 		return "", "", nil
 	}
 	if k, v, ok := strings.Cut(tok, "="); ok {
-		if _, has := vllmOptions[k]; has {
+		if _, has := opts[k]; has {
 			return "opt", k, &v
 		}
 	}
@@ -112,14 +115,14 @@ func matchOption(tok string) (string, string, *string) {
 			prefix = k
 			exp = &v
 		}
-		for o := range vllmOptions {
+		for o := range opts {
 			if strings.HasPrefix(o, prefix) {
 				cands = append(cands, cand{o, exp})
 			}
 		}
 	} else {
 		short, shortExplicit := tok[:2], tok[2:]
-		for o := range vllmOptions {
+		for o := range opts {
 			if o == short {
 				se := shortExplicit
 				cands = append(cands, cand{o, &se})
@@ -252,31 +255,7 @@ func vllmParse(kind string, tokens []word) parseResult {
 			args = na
 		}
 	}
-	for _, a := range args {
-		if !a.opaque && (a.s == "--config" || strings.HasPrefix(a.s, "--config=")) {
-			res.configFile = true
-			break
-		}
-	}
-	if res.configFile {
-		var na []word
-		skip := false
-		for _, a := range args {
-			if skip {
-				skip = false
-				continue
-			}
-			if !a.opaque && a.s == "--config" {
-				skip = true
-				continue
-			}
-			if !a.opaque && strings.HasPrefix(a.s, "--config=") {
-				continue
-			}
-			na = append(na, a)
-		}
-		args = na
-	}
+	args = stripConfig(&res, args)
 
 	// underscore/dash normalization and -O
 	var processed []word
@@ -375,7 +354,85 @@ func vllmParse(kind string, tokens []word) parseResult {
 		}
 	}
 
-	// argparse
+	opts := vllmOptions
+	if kind == "dynamo vllm" {
+		opts = dynamoVLLMOptions
+	}
+	runArgparse(&res, opts, processed, kind == "vllm serve", kind == "vllm serve" || kind == "api_server")
+	return res
+}
+
+// dynamoVLLMOptions are the vLLM options plus the flag of the Dynamo vLLM
+// launcher that tells the phase (components/src/dynamo/vllm/backend_args.py). Its
+// other own flags are unknown to the table and are skipped.
+var dynamoVLLMOptions = func() map[string]option {
+	out := map[string]option{"--disaggregation-mode": {dest: "disaggregation_mode", nargs: nargsOne}}
+	for k, v := range vllmOptions {
+		out[k] = v
+	}
+	return out
+}()
+
+// sglangParse emulates `sglang serve` (or sglang.launch_server) and plain
+// argparse on the argv after it.
+func sglangParse(kind string, tokens []word) parseResult {
+	res := parseResult{assigned: map[string]assignment{}}
+	var args []word
+	for i := 0; i < len(tokens); i++ {
+		a := tokens[i]
+		// `sglang serve` takes the backend selector out of the argv
+		if kind == "sglang serve" && !a.opaque && a.s == "--model-type" {
+			i++
+			continue
+		}
+		if kind == "sglang serve" && !a.opaque && strings.HasPrefix(a.s, "--model-type=") {
+			continue
+		}
+		args = append(args, a)
+	}
+	// `sglang serve <model>` is `sglang serve --model-path <model>`
+	if kind == "sglang serve" && len(args) > 0 && !args[0].opaque && !strings.HasPrefix(args[0].s, "-") {
+		args = append([]word{strWord("--model-path")}, args...)
+	}
+	runArgparse(&res, sglangOptions, stripConfig(&res, args), false, false)
+	return res
+}
+
+// stripConfig takes --config <file> out of the argv. The file may set any value
+// that the argv does not set.
+func stripConfig(res *parseResult, args []word) []word {
+	for _, a := range args {
+		if !a.opaque && (a.s == "--config" || strings.HasPrefix(a.s, "--config=")) {
+			res.configFile = true
+			break
+		}
+	}
+	if !res.configFile {
+		return args
+	}
+	var na []word
+	skip := false
+	for _, a := range args {
+		if skip {
+			skip = false
+			continue
+		}
+		if !a.opaque && a.s == "--config" {
+			skip = true
+			continue
+		}
+		if !a.opaque && strings.HasPrefix(a.s, "--config=") {
+			continue
+		}
+		na = append(na, a)
+	}
+	return na
+}
+
+// runArgparse applies the argparse rules of the option table to the argv. tagSlot:
+// the first item is the model tag (vllm serve); positional: one positional model
+// is accepted.
+func runArgparse(res *parseResult, opts map[string]option, processed []word, tagSlot, positional bool) {
 	classes := make([]byte, len(processed))
 	for i, a := range processed {
 		switch {
@@ -384,14 +441,14 @@ func vllmParse(kind string, tokens []word) parseResult {
 		case strings.Contains(a.s, unk) && strings.ReplaceAll(a.s, unk, "") == "":
 			classes[i] = 'U' // wholly unknown single item
 		default:
-			if k, _, _ := matchOption(a.s); k != "" {
+			if k, _, _ := matchOption(opts, a.s); k != "" {
 				classes[i] = 'O'
 			} else {
 				classes[i] = 'A'
 			}
 		}
 	}
-	if kind == "vllm serve" && len(classes) > 0 && classes[0] == 'U' {
+	if tagSlot && len(classes) > 0 && classes[0] == 'U' {
 		classes[0] = 'A' // the model tag slot
 	}
 	isValue := func(j int) bool { return j < len(classes) && (classes[j] == 'A' || classes[j] == 'U') }
@@ -411,14 +468,14 @@ func vllmParse(kind string, tokens []word) parseResult {
 				// positional and vLLM exits. Recover the intent.
 				res.errorsCount++
 				flag, val, _ := strings.Cut(a.s, " ")
-				if k, opt, _ := matchOption(flag); k == "opt" {
-					o := vllmOptions[opt]
+				if k, opt, _ := matchOption(opts, flag); k == "opt" {
+					o := opts[opt]
 					res.assigned[o.dest] = assignment{val: valueFor(o, strings.TrimSpace(val)), pos: i}
 				}
 				i++
 				continue
 			}
-			if positionalModel == nil && (kind == "vllm serve" || kind == "api_server") {
+			if positionalModel == nil && positional {
 				positionalModel = &assignment{val: argValue{s: a.s}, pos: i}
 			} else {
 				res.errorsCount++
@@ -426,7 +483,7 @@ func vllmParse(kind string, tokens []word) parseResult {
 			i++
 			continue
 		}
-		k, opt, explicit := matchOption(a.s)
+		k, opt, explicit := matchOption(opts, a.s)
 		if k == "unknown" || k == "ambiguous" {
 			res.errorsCount++
 			if !strings.Contains(a.s, "=") && isValue(i+1) {
@@ -436,7 +493,7 @@ func vllmParse(kind string, tokens []word) parseResult {
 			}
 			continue
 		}
-		o := vllmOptions[opt]
+		o := opts[opt]
 		switch o.nargs {
 		case nargsZero:
 			if explicit != nil && *explicit != "" {
@@ -460,7 +517,7 @@ func vllmParse(kind string, tokens []word) parseResult {
 				res.assigned[o.dest] = assignment{val: argValue{b: &trueV}, pos: i}
 				i++
 			}
-		case nargsPlus:
+		case nargsPlus, nargsStar:
 			var vals []string
 			j := i + 1
 			if explicit != nil {
@@ -475,7 +532,7 @@ func vllmParse(kind string, tokens []word) parseResult {
 					j++
 				}
 			}
-			if len(vals) == 0 {
+			if len(vals) == 0 && o.nargs == nargsPlus {
 				res.errorsCount++
 				vals = []string{unk}
 			}
@@ -504,10 +561,9 @@ func vllmParse(kind string, tokens []word) parseResult {
 			}
 		}
 	}
-	if kind == "vllm serve" && positionalModel != nil {
+	if tagSlot && positionalModel != nil {
 		res.modelTag = positionalModel
 	}
-	return res
 }
 
 func valueFor(o option, raw string) argValue {
@@ -515,7 +571,7 @@ func valueFor(o option, raw string) argValue {
 	case nargsZero:
 		b := !o.neg
 		return argValue{b: &b}
-	case nargsPlus:
+	case nargsPlus, nargsStar:
 		return argValue{list: strings.Fields(raw), isLst: true}
 	}
 	return argValue{s: raw}
@@ -592,7 +648,7 @@ func boolString(b bool) string {
 	return "false"
 }
 
-// argFields lists the values that the pod args give, with their converters.
+// argFields lists the vLLM values that the pod args give, with their converters.
 var argFields = []struct {
 	name string
 	dest string
@@ -613,84 +669,217 @@ var argFields = []struct {
 	{valGPUMemoryUtilization, "gpu_memory_utilization", convFloat},
 }
 
-// fieldValues maps a parse result to a status and value per field.
-func fieldValues(kind string, pr parseResult) map[string]fieldValue {
-	res := map[string]fieldValue{}
-	lastOpaque := -1
+// fieldReader gives the status and value of each parsed destination.
+type fieldReader struct {
+	pr         parseResult
+	lastOpaque int
+}
+
+func newFieldReader(pr parseResult) fieldReader {
+	r := fieldReader{pr: pr, lastOpaque: -1}
 	for _, p := range pr.opaquePos {
-		if p > lastOpaque {
-			lastOpaque = p
+		if p > r.lastOpaque {
+			r.lastOpaque = p
 		}
 	}
-	statusOf := func(pos int, has bool) fieldStatus {
-		if !has {
-			if lastOpaque >= 0 || pr.configFile {
-				return statusUnknown
-			}
-			return statusDefault
-		}
-		if lastOpaque > pos {
+	return r
+}
+
+// status: a value that is not set is "default", unless an unknown expansion or a
+// config file may set it; an unknown expansion after a value may override it.
+func (r fieldReader) status(pos int, has bool) fieldStatus {
+	if !has {
+		if r.lastOpaque >= 0 || r.pr.configFile {
 			return statusUnknown
 		}
-		return statusSet
+		return statusDefault
 	}
-	put := func(field, dest string, conv converter) {
-		as, ok := pr.assigned[dest]
-		if !ok {
-			res[field] = fieldValue{Status: statusOf(0, false)}
-			return
-		}
-		st := statusOf(as.pos, true)
-		if st != statusSet {
-			res[field] = fieldValue{Status: st}
-			return
-		}
-		if as.val.unknown() {
-			res[field] = fieldValue{Status: statusUnknown}
-			return
-		}
-		switch {
-		case as.val.b != nil:
-			res[field] = fieldValue{Status: statusSet, Value: boolString(*as.val.b)}
-		case as.val.isLst:
-			res[field] = fieldValue{Status: statusSet, Value: strings.Join(as.val.list, ",")}
-		case conv != nil:
-			v, isNone, convOK := conv(as.val.s)
-			switch {
-			case !convOK:
-				res[field] = fieldValue{Status: statusSet, Value: as.val.s}
-			case isNone:
-				res[field] = fieldValue{Status: statusDefault}
-			default:
-				res[field] = fieldValue{Status: statusSet, Value: v}
-			}
-		default:
-			res[field] = fieldValue{Status: statusSet, Value: as.val.s}
-		}
+	if r.lastOpaque > pos {
+		return statusUnknown
 	}
+	return statusSet
+}
 
-	// model
+func (r fieldReader) value(dest string, conv converter) fieldValue {
+	as, ok := r.pr.assigned[dest]
+	if !ok {
+		return fieldValue{Status: r.status(0, false)}
+	}
+	if st := r.status(as.pos, true); st != statusSet {
+		return fieldValue{Status: st}
+	}
+	if as.val.unknown() {
+		return fieldValue{Status: statusUnknown}
+	}
+	switch {
+	case as.val.b != nil:
+		return set(boolString(*as.val.b))
+	case as.val.isLst:
+		return set(strings.Join(as.val.list, ","))
+	case conv != nil:
+		v, isNone, convOK := conv(as.val.s)
+		switch {
+		case !convOK:
+			return set(as.val.s)
+		case isNone:
+			return fieldValue{Status: statusDefault}
+		}
+		return set(v)
+	}
+	return set(as.val.s)
+}
+
+// first is value for a list destination: the first item.
+func (r fieldReader) first(dest string) fieldValue {
+	fv := r.value(dest, nil)
+	if as := r.pr.assigned[dest]; fv.Status == statusSet && as.val.isLst && len(as.val.list) > 0 {
+		fv.Value = as.val.list[0]
+	}
+	return fv
+}
+
+// vllmFieldValues maps a vLLM parse result to a status and value per field.
+func vllmFieldValues(kind string, pr parseResult) map[string]fieldValue {
+	r := newFieldReader(pr)
+	res := map[string]fieldValue{}
 	if kind == "vllm serve" {
 		if mt := pr.modelTag; mt != nil {
 			switch {
 			case mt.val.unknown():
 				res[valModel] = fieldValue{Status: statusUnknown}
-			case lastOpaque >= 0 && lastOpaque < mt.pos:
+			case r.lastOpaque >= 0 && r.lastOpaque < mt.pos:
 				res[valModel] = fieldValue{Status: statusUnknown}
 			default:
-				res[valModel] = fieldValue{Status: statusSet, Value: mt.val.s}
+				res[valModel] = set(mt.val.s)
 			}
 		} else {
-			res[valModel] = fieldValue{Status: statusOf(0, false)}
+			res[valModel] = fieldValue{Status: r.status(0, false)}
 		}
 	} else {
-		put(valModel, "model", nil)
+		res[valModel] = r.value("model", nil)
 	}
 	for _, f := range argFields {
-		put(f.name, f.dest, f.conv)
+		res[f.name] = r.value(f.dest, f.conv)
 	}
-	speculativeFields(pr, statusOf, res)
+	// ModelConfig keeps the first served model name (get_served_model_name)
+	res[valServedModelName] = r.first("served_model_name")
+	speculativeFields(pr, r.status, res)
 	return res
+}
+
+// sglangConverters normalize the SGLang flags that are not strings or booleans;
+// the destination of each SGLang value is the value name.
+var sglangConverters = map[string]converter{
+	"tp_size": convInt, "pp_size": convInt, "dp_size": convInt, "mem_fraction_static": convFloat,
+	"chunked_prefill_size": convInt, "max_running_requests": convInt, "speculative_num_draft_tokens": convInt,
+	"speculative_num_steps": convInt, "max_prefill_tokens": convSGLangHumanInt,
+	"max_total_tokens": convSGLangHumanInt, "context_length": convSGLangHumanInt,
+}
+
+func sglangFieldValues(pr parseResult) map[string]fieldValue {
+	r := newFieldReader(pr)
+	res := map[string]fieldValue{}
+	for _, name := range sglangValues {
+		if name != sgVersion {
+			res[name] = r.value(name, sglangConverters[name])
+		}
+	}
+	return res
+}
+
+var sglangHumanIntRE = regexp.MustCompile(`^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|k|M|G|T)$`)
+
+// convSGLangHumanInt ports SGLang's human_readable_int: SI suffixes k, M, G, T
+// (decimals allowed) and IEC suffixes Ki, Mi, Gi, Ti. vLLM's rule differs.
+func convSGLangHumanInt(raw string) (string, bool, bool) {
+	v := strings.TrimSpace(raw)
+	m := sglangHumanIntRE.FindStringSubmatch(v)
+	if m == nil {
+		return convInt(v)
+	}
+	if shift, iec := map[string]uint{"Ki": 10, "Mi": 20, "Gi": 30, "Ti": 40}[m[2]]; iec {
+		n, err := strconv.ParseInt(m[1], 10, 64)
+		if err != nil {
+			return "", false, false
+		}
+		return strconv.FormatInt(n<<shift, 10), false, true
+	}
+	f, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return "", false, false
+	}
+	mult := map[string]float64{"k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}[m[2]]
+	return strconv.FormatInt(int64(math.Round(f*mult)), 10), false, true
+}
+
+// flagPhase gives the phase that the engine flags set, or "" when they do not
+// decide (note section 1.4). vLLM: --ec-transfer-config ec_role, then
+// --kv-transfer-config kv_role; no transfer config is unified, kv_both does not
+// decide. SGLang: --enable-pd-role-switch, then --disaggregation-mode (null and
+// not set are unified). The Dynamo launchers decide only by their
+// --disaggregation-mode, because their pods carry no transfer config.
+func flagPhase(kind string, pr parseResult) string {
+	r := newFieldReader(pr)
+	mode := r.value("disaggregation_mode", nil)
+	switch kind {
+	case "dynamo vllm", "dynamo sglang":
+		if mode.Status == statusSet {
+			return disaggModePhases[mode.Value]
+		}
+		return ""
+	case "sglang serve", "sglang launch_server":
+		if v := r.value(sgEnablePDRoleSwitch, nil); v.Status == statusSet && v.Value == "true" {
+			return phaseDynamic
+		}
+		switch mode.Status {
+		case statusSet:
+			return disaggModePhases[mode.Value]
+		case statusDefault:
+			return phaseUnified
+		}
+		return ""
+	}
+	ec, kv := r.value("ec_transfer_config", nil), r.value("kv_transfer_config", nil)
+	if p := jsonRole(ec, "ec_role", vllmECPhases); p != "" {
+		return p
+	}
+	switch {
+	case kv.Status == statusSet:
+		return jsonRole(kv, "kv_role", vllmKVPhases)
+	case kv.Status == statusDefault && ec.Status != statusUnknown:
+		return phaseUnified
+	}
+	return ""
+}
+
+// jsonRole maps the role key of a JSON transfer config flag.
+func jsonRole(fv fieldValue, key string, phases map[string]string) string {
+	var cfg map[string]any
+	if fv.Status != statusSet || json.Unmarshal([]byte(fv.Value), &cfg) != nil {
+		return ""
+	}
+	role, _ := cfg[key].(string)
+	return phases[role]
+}
+
+// flagGroup gives the group role that the engine flags set: --headless (vLLM) or
+// --node-rank above 0 is a worker; --node-rank 0 with --nnodes above 1 is the
+// leader. Both engines use the same dests.
+func flagGroup(pr parseResult) string {
+	r := newFieldReader(pr)
+	if v := r.value("headless", nil); v.Status == statusSet && v.Value == "true" {
+		return groupWorker
+	}
+	rank, nnodes := r.value("node_rank", convInt), r.value("nnodes", convInt)
+	n, _ := strconv.Atoi(rank.Value)
+	nodes, _ := strconv.Atoi(nnodes.Value)
+	switch {
+	case rank.Status == statusSet && n > 0:
+		return groupWorker
+	case nnodes.Status == statusSet && nodes > 1 && (rank.Status == statusDefault || (rank.Status == statusSet && n == 0)):
+		return groupLeader
+	}
+	return ""
 }
 
 // speculativeFields reads --speculative-config (JSON or dotted keys), the v0.32

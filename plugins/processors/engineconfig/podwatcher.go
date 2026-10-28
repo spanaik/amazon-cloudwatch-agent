@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT
 
-package vllmconfig
+package engineconfig
 
 import (
 	"context"
@@ -23,9 +23,9 @@ import (
 const (
 	// minimizedMarker marks a pod object that the transform built. The API server
 	// never sends this apiVersion, so a customer annotation cannot pose as one.
-	minimizedMarker = "vllmconfig.cloudwatch-agent.internal/v1"
+	minimizedMarker = "engineconfig.cloudwatch-agent.internal/v1"
 	// podInfoAnnotation holds the parsed, allowlisted values of the pod.
-	podInfoAnnotation = "vllmconfig.cloudwatch-agent.internal/info"
+	podInfoAnnotation = "engineconfig.cloudwatch-agent.internal/info"
 	ipIndex           = "podIP"
 	syncWait          = 5 * time.Second
 )
@@ -33,12 +33,16 @@ const (
 // containerInfo is what the transform keeps of a container: its TCP ports and the
 // parsed values. Raw command, args and env values are not kept.
 type containerInfo struct {
-	Name  string                `json:"n"`
-	Ports []string              `json:"p,omitempty"`
-	VLLM  bool                  `json:"m,omitempty"` // the image or command line names vLLM
-	Args  map[string]fieldValue `json:"a,omitempty"` // nil: no vLLM command line in the pod spec
-	Env   envContract           `json:"e,omitempty"`
-	UseV1 string                `json:"v1,omitempty"`
+	Name   string                `json:"n"`
+	Ports  []string              `json:"p,omitempty"`
+	Engine bool                  `json:"m,omitempty"`  // the image or command line names the engine
+	Args   map[string]fieldValue `json:"a,omitempty"`  // nil: no engine command line in the pod spec
+	Phase  string                `json:"ph,omitempty"` // the phase that the engine flags set
+	Group  string                `json:"g,omitempty"`  // the group role that the engine flags set
+	KServe string                `json:"kg,omitempty"` // the group role of the KServe container rule
+	Image  string                `json:"iv,omitempty"` // the release in the image tag
+	Env    envContract           `json:"e,omitempty"`
+	UseV1  string                `json:"v1,omitempty"`
 }
 
 type podInfo struct {
@@ -47,11 +51,14 @@ type podInfo struct {
 
 // podView is one pod as the resolver sees it.
 type podView struct {
-	uid       types.UID
-	name      string
-	namespace string
-	restarts  int64
-	info      podInfo
+	uid         types.UID
+	name        string
+	namespace   string
+	restarts    map[string]int32 // per container
+	labels      map[string]string
+	annotations map[string]string
+	owners      []owner
+	info        podInfo
 }
 
 // podLookup finds the pod of a scrape target.
@@ -60,40 +67,77 @@ type podLookup interface {
 }
 
 // podInfoFromSpec parses the allowlisted values out of the pod spec.
-func podInfoFromSpec(pod *corev1.Pod, envMap map[string]string) podInfo {
+func podInfoFromSpec(pod *corev1.Pod, engine string, envMap map[string]string) podInfo {
 	var info podInfo
 	for _, c := range pod.Spec.Containers {
 		spec := containerSpec{Command: c.Command, Args: c.Args, EnvFrom: len(c.EnvFrom) > 0, Image: c.Image}
 		for _, e := range c.Env {
 			spec.Env = append(spec.Env, envVar{Name: e.Name, Value: e.Value, FromSource: e.ValueFrom != nil})
 		}
-		ci := containerInfo{Name: c.Name, VLLM: mentionsVLLM(spec)}
+		ci := containerInfo{Name: c.Name, Engine: mentionsEngine(spec, engine), Image: imageVersion(c.Image),
+			KServe: kserveGroup(c.Name, buildEnv(spec.Env, spec.EnvFrom))}
 		for _, p := range c.Ports {
 			if p.Protocol == "" || p.Protocol == corev1.ProtocolTCP {
 				ci.Ports = append(ci.Ports, strconv.Itoa(int(p.ContainerPort)))
 			}
 		}
-		if res := parseContainerArgs(spec); res.found {
-			ci.Args = res.fields
+		if res := parseContainerArgs(spec, engine); res.found {
+			ci.Args, ci.Phase, ci.Group = res.fields, res.phase, res.group
 		}
-		ci.Env = readEnvContract(envMap, spec.Env, spec.EnvFrom)
-		ci.UseV1 = useV1Env(spec.Env, spec.EnvFrom)
+		if engine == engineVLLM {
+			ci.Env = readEnvContract(envMap, spec.Env, spec.EnvFrom)
+			ci.UseV1 = useV1Env(spec.Env, spec.EnvFrom)
+		}
 		info.Containers = append(info.Containers, ci)
 	}
 	return info
 }
 
+// kserveGroup gives the group role of the KServe multi-node container rule.
+func kserveGroup(name string, env map[string]string) string {
+	switch name {
+	case kserveWorkerContainer:
+		return groupWorker
+	case kserveContainer:
+		if n, err := strconv.Atoi(env[kserveNodeCountEnv]); err == nil && n > 1 {
+			return groupLeader
+		}
+	}
+	return ""
+}
+
 // minimizePod is the informer transform. It parses the allowlisted values and
-// returns a small pod object without command, args, env, annotations or labels.
-func minimizePod(envMap map[string]string) cache.TransformFunc {
+// returns a small pod object without command, args or env, with only the
+// allowlisted labels and annotations and the kind and name of the owners.
+func minimizePod(engine string, envMap map[string]string) cache.TransformFunc {
+	keep := watchedLabels()
 	return func(obj any) (any, error) {
 		pod, ok := obj.(*corev1.Pod)
 		if !ok || pod.APIVersion == minimizedMarker {
 			return obj, nil
 		}
-		data, err := json.Marshal(podInfoFromSpec(pod, envMap))
+		data, err := json.Marshal(podInfoFromSpec(pod, engine, envMap))
 		if err != nil {
 			data = []byte(`{"c":null}`)
+		}
+		var labels map[string]string
+		for k, v := range pod.Labels {
+			if keep[k] {
+				if labels == nil {
+					labels = map[string]string{}
+				}
+				labels[k] = v
+			}
+		}
+		annotations := map[string]string{podInfoAnnotation: string(data)}
+		for k, v := range pod.Annotations {
+			if watchedAnnotations[k] {
+				annotations[k] = v
+			}
+		}
+		var owners []metav1.OwnerReference
+		for _, o := range pod.OwnerReferences {
+			owners = append(owners, metav1.OwnerReference{Kind: o.Kind, Name: o.Name})
 		}
 		out := &corev1.Pod{
 			TypeMeta: metav1.TypeMeta{APIVersion: minimizedMarker},
@@ -102,7 +146,9 @@ func minimizePod(envMap map[string]string) cache.TransformFunc {
 				Namespace:       pod.Namespace,
 				UID:             pod.UID,
 				ResourceVersion: pod.ResourceVersion,
-				Annotations:     map[string]string{podInfoAnnotation: string(data)},
+				Labels:          labels,
+				OwnerReferences: owners,
+				Annotations:     annotations,
 			},
 			Spec: corev1.PodSpec{NodeName: pod.Spec.NodeName, HostNetwork: pod.Spec.HostNetwork},
 			Status: corev1.PodStatus{
@@ -148,14 +194,14 @@ type podWatcher struct {
 	lastWarn time.Time
 }
 
-func newPodWatcher(client kubernetes.Interface, nodeName string, envMap map[string]string, logger *zap.Logger, onDelete func(types.UID)) (*podWatcher, error) {
+func newPodWatcher(client kubernetes.Interface, nodeName, engine string, envMap map[string]string, logger *zap.Logger, onDelete func(types.UID)) (*podWatcher, error) {
 	factory := informers.NewSharedInformerFactoryWithOptions(client, 0,
 		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
 			o.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", nodeName).String()
 		}))
 	informer := factory.Core().V1().Pods().Informer()
 	w := &podWatcher{logger: logger, informer: informer, factory: factory, onDelete: onDelete}
-	if err := informer.SetTransform(minimizePod(envMap)); err != nil {
+	if err := informer.SetTransform(minimizePod(engine, envMap)); err != nil {
 		return nil, err
 	}
 	if err := informer.AddIndexers(cache.Indexers{ipIndex: indexByIP}); err != nil {
@@ -166,7 +212,7 @@ func newPodWatcher(client kubernetes.Interface, nodeName string, envMap map[stri
 		defer w.warnMu.Unlock()
 		if time.Since(w.lastWarn) >= time.Minute {
 			w.lastWarn = time.Now()
-			logger.Warn("vllmconfig: pod watch failed; metrics pass through without engine values until it recovers", zap.Error(err))
+			logger.Warn("engineconfig: pod watch failed; metrics pass through without engine values until it recovers", zap.Error(err))
 		}
 	}); err != nil {
 		return nil, err
@@ -199,7 +245,7 @@ func (w *podWatcher) start(stopCh <-chan struct{}) {
 		}
 	}()
 	if !cache.WaitForCacheSync(ctx.Done(), w.informer.HasSynced) {
-		w.logger.Warn("vllmconfig: pod informer has not synced yet; metrics pass through until it does")
+		w.logger.Warn("engineconfig: pod informer has not synced yet; metrics pass through until it does")
 	}
 }
 
@@ -269,16 +315,29 @@ func decodePodInfo(pod *corev1.Pod) podInfo {
 }
 
 func viewOf(pod *corev1.Pod) podView {
-	v := podView{uid: pod.UID, name: pod.Name, namespace: pod.Namespace, info: decodePodInfo(pod)}
+	v := podView{uid: pod.UID, name: pod.Name, namespace: pod.Namespace, info: decodePodInfo(pod),
+		restarts: map[string]int32{}}
+	if pod.APIVersion == minimizedMarker {
+		v.labels = pod.Labels
+		v.annotations = map[string]string{}
+		for k, val := range pod.Annotations {
+			if watchedAnnotations[k] {
+				v.annotations[k] = val
+			}
+		}
+		for _, o := range pod.OwnerReferences {
+			v.owners = append(v.owners, owner{Kind: o.Kind, Name: o.Name})
+		}
+	}
 	for _, cs := range pod.Status.ContainerStatuses {
-		v.restarts += int64(cs.RestartCount)
+		v.restarts[cs.Name] = cs.RestartCount
 	}
 	return v
 }
 
 // scrapedContainer picks the container that serves the scrape: the one that
 // declares the scrape port, else the one the receiver names, else the first one
-// whose image or command line names vLLM, else the first one.
+// whose image or command line names the engine, else the first one.
 func (v podView) scrapedContainer(t scrapeTarget) (containerInfo, bool) {
 	cs := v.info.Containers
 	if len(cs) == 0 {
@@ -299,7 +358,7 @@ func (v podView) scrapedContainer(t scrapeTarget) (containerInfo, bool) {
 		}
 	}
 	for _, c := range cs {
-		if c.VLLM {
+		if c.Engine {
 			return c, true
 		}
 	}
