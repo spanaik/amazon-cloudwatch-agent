@@ -148,18 +148,6 @@ func TestConsumeLogsNotUsed(t *testing.T) {
 	assert.Equal(t, zapcore.WarnLevel, tooLarge[0].Level)
 }
 
-func TestConsumeLogsWithoutSourceFileAttribute(t *testing.T) {
-	cfg := testConfig()
-	cfg.SourceFileAttribute = ""
-	conn, _ := newTestConnector(t, cfg, consumertest.NewNop())
-	ld := plog.NewLogs()
-	addRecord(addResource(ld, podResource("p1")), base, "app started", "")
-	require.NoError(t, conn.ConsumeLogs(t.Context(), ld))
-	kept := conn.state.entries()
-	require.Len(t, kept, 1)
-	assert.Empty(t, kept[0].entry.SourceFile)
-}
-
 func TestConsumeLogsConditions(t *testing.T) {
 	cfg := testConfig()
 	cfg.Rules[0].Conditions = []string{`attributes["log.iostream"] == "stderr"`}
@@ -274,4 +262,20 @@ func BenchmarkConsumeLogsMatch(b *testing.B) {
 	for b.Loop() {
 		_ = conn.ConsumeLogs(ctx, ld)
 	}
+}
+
+// TestConsumeLogsTooLargeRemovesStale checks that a newer record that is
+// too large to keep removes the kept record of its entity, which would show
+// a configuration that is gone.
+func TestConsumeLogsTooLargeRemovesStale(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxRecordBytes = minMaxRecordBytes
+	conn, _ := newTestConnector(t, cfg, consumertest.NewNop())
+	ctx := t.Context()
+	require.NoError(t, conn.ConsumeLogs(ctx, podLogs("p1", base, "app started version=1")))
+	huge := "app started version=2 " + strings.Repeat("x", minMaxRecordBytes)
+	require.NoError(t, conn.ConsumeLogs(ctx, podLogs("p1", base.Add(-time.Minute), huge)))
+	assert.Len(t, conn.state.entries(), 1, "an older record that is too large changes nothing")
+	require.NoError(t, conn.ConsumeLogs(ctx, podLogs("p1", base.Add(time.Minute), huge)))
+	assert.Empty(t, conn.state.entries())
 }

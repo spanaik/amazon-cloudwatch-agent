@@ -7,7 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
+	"slices"
 	"time"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottllog"
@@ -33,8 +33,12 @@ type replayConnector struct {
 	tel    *telemetry
 	// now returns the current time. Tests replace it.
 	now func() time.Time
-	// statFile checks that a source file exists. Tests replace it.
-	statFile func(path string) error
+	// checkSource returns nil when a source file exists, and an error
+	// that wraps fs.ErrNotExist when it does not. Tests replace it.
+	checkSource func(path string) error
+	// recheckDelay is the wait before a missing source file is checked a
+	// second time. Tests replace it.
+	recheckDelay time.Duration
 
 	// startupDelay and jitter set the first tick: startupDelay plus
 	// jitter(min(interval, maxStartupJitter)). jitter returns a duration in
@@ -89,18 +93,12 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Logs) (*rep
 		state:        st,
 		tel:          tel,
 		now:          time.Now,
-		statFile:     statFile,
+		checkSource:  lstatFile,
+		recheckDelay: sourceRecheckDelay,
 		startupDelay: startupReplayDelay,
 		jitter:       randomJitter,
 		changed:      func() {},
 	}, nil
-}
-
-// statFile returns nil when path names an existing file, following
-// symbolic links.
-func statFile(path string) error {
-	_, err := os.Stat(path)
-	return err
 }
 
 // Start restores the stored records when storage is configured, then
@@ -267,6 +265,8 @@ func (c *replayConnector) observe(ctx context.Context, b *batch, ri int, rl plog
 	if len(data) > c.cfg.MaxRecordBytes {
 		counts.notUsed[notUsedTooLarge]++
 		c.logTooLarge(rule.cfg.Name, len(data))
+		// The state removes a kept record of the entity that is not newer.
+		b.obs = append(b.obs, observation{rule: ri, key: id.key, time: c.recordTime(lr), tooLarge: true})
 		return nil
 	}
 
@@ -296,26 +296,26 @@ func (c *replayConnector) apply(ctx context.Context, b *batch) {
 		c.changed()
 	}
 	c.tel.recordRemovals(ctx, res.removed, res.rejected)
-	c.logRemovals(res.removed, len(res.rejected))
+	c.logRemovals(res.removed, res.rejected)
 }
 
 // logRemovals logs a removal for max_entries or max_state_bytes at Warn, at
 // most once per logInterval for each of the two. The removed entries are
-// the oldest ones, so the limit is too small only if their engines still
-// run. Other removals, and the ones in between, are logged at Debug.
-func (c *replayConnector) logRemovals(removed []removal, rejected int) {
-	if len(removed) == 0 && rejected == 0 {
+// the oldest ones, so the limit is too small only if their sources still
+// run. Other removals, and the ones in between, are logged at Debug. The
+// rejected entries count as removed.
+func (c *replayConnector) logRemovals(removed, rejected []removal) {
+	if len(removed) == 0 && len(rejected) == 0 {
 		return
 	}
 	var counts [numRemoveReasons]int64
 	var firstRule [numRemoveReasons]int
-	for _, r := range removed {
+	for _, r := range slices.Concat(removed, rejected) {
 		if counts[r.reason] == 0 {
 			firstRule[r.reason] = r.rule
 		}
 		counts[r.reason]++
 	}
-	counts[removeTooLarge] += int64(rejected)
 	var now int64
 	for _, reason := range [...]removeReason{removeMaxEntries, removeMaxStateBytes} {
 		n := counts[reason]

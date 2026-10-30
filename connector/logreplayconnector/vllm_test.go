@@ -162,7 +162,7 @@ func TestVLLMFixtures(t *testing.T) {
 	sink := new(consumertest.LogsSink)
 	conn, _ := newTestConnector(t, loadVLLMRuleFile(t), sink)
 	files := newFakeFiles()
-	conn.statFile = files.stat
+	conn.checkSource = files.stat
 	ld := fixtureLogs(fixtures)
 	require.NoError(t, conn.ConsumeLogs(t.Context(), ld))
 

@@ -62,6 +62,10 @@ type observation struct {
 	sourceFile string
 	// time is the record time in Unix nanoseconds.
 	time int64
+	// tooLarge marks a record larger than max_record_bytes. It has no
+	// record, and it removes a kept entry that is not newer, because that
+	// entry is stale.
+	tooLarge bool
 }
 
 // outcome is the result of applying one observation.
@@ -77,9 +81,13 @@ const (
 	// outcomeIgnoredOlder: the record is older than the entry and was not
 	// used.
 	outcomeIgnoredOlder
-	// outcomeTooLarge: the entry alone exceeds max_state_bytes and was not
-	// stored. If an entry existed, it was removed, because it was stale.
+	// outcomeTooLarge: the record is larger than max_record_bytes, or the
+	// entry alone exceeds max_state_bytes, and it was not stored. If an
+	// entry that is not newer existed, it was removed, because it was stale.
 	outcomeTooLarge
+	// outcomeOverLimit: the rule keeps max_entries records, and the record
+	// is older than all of them, so it was not stored.
+	outcomeOverLimit
 
 	numOutcomes
 )
@@ -96,12 +104,12 @@ type removeReason uint8
 const (
 	// removeSourceGone: the source file of the record no longer exists.
 	removeSourceGone removeReason = iota
-	// removeMaxEntries: a new entry of the same rule needed room.
+	// removeMaxEntries: a new entry of the same rule needed room, or a new
+	// entry was older than every entry of a full rule.
 	removeMaxEntries
 	// removeMaxStateBytes: the state was over max_state_bytes.
 	removeMaxStateBytes
-	// removeTooLarge: a new record made the entry alone exceed
-	// max_state_bytes.
+	// removeTooLarge: a new record of the entry is too large to keep.
 	removeTooLarge
 
 	numRemoveReasons
@@ -118,15 +126,22 @@ type batchResult struct {
 	// counts is indexed by outcome.
 	counts  [numOutcomes]int
 	removed []removal
-	// rejected lists the new entries that were not stored because each
-	// alone exceeds max_state_bytes.
-	rejected []entryRef
+	// rejected lists the new entries that were not stored because of a
+	// state limit: max_state_bytes (reason too_large) or max_entries.
+	rejected []removal
 }
 
 // changed reports whether the batch changed the stored records.
 func (r *batchResult) changed() bool {
-	return r.counts[outcomeInserted] > 0 || r.counts[outcomeReplaced] > 0 ||
-		r.counts[outcomeTooLarge] > 0 || len(r.removed) > 0
+	return r.counts[outcomeInserted] > 0 || r.counts[outcomeReplaced] > 0 || len(r.removed) > 0
+}
+
+// applyResult is the result of applying one observation.
+type applyResult struct {
+	outcome outcome
+	removed []removal
+	// rejected is set when a new entry was not stored because of a limit.
+	rejected *removal
 }
 
 // ruleSpec is what the state needs to know about a rule.
@@ -156,6 +171,9 @@ type state struct {
 	maxStateBytes int
 	// bytes is the sum of the size estimates of all entries.
 	bytes int
+	// lastReplay is the time (Unix nanoseconds) of the latest tick whose
+	// copies the next consumer accepted, 0 if none.
+	lastReplay int64
 }
 
 func newState(specs []ruleSpec, maxStateBytes int) *state {
@@ -177,48 +195,60 @@ func (s *state) applyBatch(obs []observation) batchResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range obs {
-		out, removed := s.applyLocked(&obs[i])
-		res.counts[out]++
-		res.removed = append(res.removed, removed...)
-		if out == outcomeTooLarge && len(removed) == 0 {
-			res.rejected = append(res.rejected, entryRef{rule: obs[i].rule, key: obs[i].key})
+		r := s.applyLocked(&obs[i])
+		res.counts[r.outcome]++
+		res.removed = append(res.removed, r.removed...)
+		if r.rejected != nil {
+			res.rejected = append(res.rejected, *r.rejected)
 		}
 	}
 	return res
 }
 
-func (s *state) applyLocked(o *observation) (outcome, []removal) {
-	next := entry{Identity: o.identity, Record: o.record, SourceFile: o.sourceFile, Time: o.time}
+func (s *state) applyLocked(o *observation) applyResult {
+	ref := entryRef{rule: o.rule, key: o.key}
 	rs := &s.rules[o.rule]
 	cur, exists := rs.entries[o.key]
+	if o.tooLarge {
+		// The record itself is not kept. A kept record that is not newer is
+		// stale, and sending it would show a configuration that is gone.
+		if exists && o.time >= cur.Time {
+			s.removeLocked(ref)
+			return applyResult{outcome: outcomeTooLarge, removed: []removal{{entryRef: ref, reason: removeTooLarge}}}
+		}
+		return applyResult{outcome: outcomeTooLarge}
+	}
+	next := entry{Identity: o.identity, Record: o.record, SourceFile: o.sourceFile, Time: o.time}
 	if !exists {
 		return s.insertLocked(o.rule, o.key, next)
 	}
 	if o.time < cur.Time {
-		return outcomeIgnoredOlder, nil
+		return applyResult{outcome: outcomeIgnoredOlder}
 	}
 	if o.time == cur.Time && o.sourceFile == cur.SourceFile && bytes.Equal(o.record, cur.Record) {
-		return outcomeUnchanged, nil
+		return applyResult{outcome: outcomeUnchanged}
 	}
 	size := entrySize(o.key, &next)
 	if size > s.maxStateBytes {
 		// Keeping the previous record would send a record known to be stale.
-		ref := entryRef{rule: o.rule, key: o.key}
 		s.removeLocked(ref)
-		return outcomeTooLarge, []removal{{entryRef: ref, reason: removeTooLarge}}
+		return applyResult{outcome: outcomeTooLarge, removed: []removal{{entryRef: ref, reason: removeTooLarge}}}
 	}
 	s.bytes += size - cur.size
 	cur.entry, cur.size = next, size
-	return outcomeReplaced, s.evictForBytesLocked(o.rule, o.key)
+	return applyResult{outcome: outcomeReplaced, removed: s.evictForBytesLocked(o.rule, o.key)}
 }
 
 // insertLocked stores a new entry, evicting the rule's oldest entry at
 // max_entries, then the oldest entries of any rule while the state is over
-// max_state_bytes.
-func (s *state) insertLocked(rule int, key string, e entry) (outcome, []removal) {
+// max_state_bytes. At max_entries, a new entry that is older than every
+// entry of the rule is not stored, because the rule keeps the latest
+// records.
+func (s *state) insertLocked(rule int, key string, e entry) applyResult {
+	self := entryRef{rule: rule, key: key}
 	size := entrySize(key, &e)
 	if size > s.maxStateBytes {
-		return outcomeTooLarge, nil
+		return applyResult{outcome: outcomeTooLarge, rejected: &removal{entryRef: self, reason: removeTooLarge}}
 	}
 	rs := &s.rules[rule]
 	var removed []removal
@@ -227,12 +257,15 @@ func (s *state) insertLocked(rule int, key string, e entry) (outcome, []removal)
 		if !ok {
 			break
 		}
+		if e.Time < rs.entries[victim.key].Time {
+			return applyResult{outcome: outcomeOverLimit, removed: removed, rejected: &removal{entryRef: self, reason: removeMaxEntries}}
+		}
 		s.removeLocked(victim)
 		removed = append(removed, removal{entryRef: victim, reason: removeMaxEntries})
 	}
 	rs.entries[key] = &storedEntry{entry: e, size: size}
 	s.bytes += size
-	return outcomeInserted, append(removed, s.evictForBytesLocked(rule, key)...)
+	return applyResult{outcome: outcomeInserted, removed: append(removed, s.evictForBytesLocked(rule, key)...)}
 }
 
 // evictForBytesLocked evicts the oldest entries of any rule, never the entry
@@ -397,9 +430,26 @@ func jsonStringLen(s string) int {
 }
 
 // stateSnapshot is the serializable form of the state: rule name, then
-// identity key, then entry. Rules without entries are omitted.
+// identity key, then entry. Rules without entries are omitted. LastReplay
+// is the time (Unix nanoseconds) of the latest copies, so that a restart
+// does not send them again before the interval ends.
 type stateSnapshot struct {
-	Rules map[string]map[string]entry `json:"rules"`
+	Rules      map[string]map[string]entry `json:"rules"`
+	LastReplay int64                       `json:"last_replay,omitempty"`
+}
+
+// setLastReplay stores the time of the latest copies.
+func (s *state) setLastReplay(t int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastReplay = t
+}
+
+// lastReplayTime returns the time of the latest copies, 0 if none.
+func (s *state) lastReplayTime() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastReplay
 }
 
 // snapshot returns a copy of the state. The entries share their slices with
@@ -408,7 +458,7 @@ type stateSnapshot struct {
 func (s *state) snapshot() stateSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snap := stateSnapshot{Rules: make(map[string]map[string]entry, len(s.rules))}
+	snap := stateSnapshot{Rules: make(map[string]map[string]entry, len(s.rules)), LastReplay: s.lastReplay}
 	for i := range s.rules {
 		rs := &s.rules[i]
 		if len(rs.entries) == 0 {
@@ -429,11 +479,11 @@ type restoredEntry struct {
 	entry entry
 }
 
-// restore replaces the state with the given entries and returns how many it
-// kept and how many the limits dropped. It enforces max_entries and
-// max_state_bytes, keeping the most recent records. The state takes
-// ownership of the entries' slices.
-func (s *state) restore(items []restoredEntry) (int, int) {
+// restore replaces the state with the given entries and the time of the
+// latest copies, and returns how many entries it kept and how many the
+// limits dropped. It enforces max_entries and max_state_bytes, keeping the
+// most recent records. The state takes ownership of the entries' slices.
+func (s *state) restore(items []restoredEntry, lastReplay int64) (int, int) {
 	// Insert the oldest first, so that the limits evict them.
 	slices.SortFunc(items, func(a, b restoredEntry) int {
 		return cmp.Or(
@@ -449,11 +499,12 @@ func (s *state) restore(items []restoredEntry) (int, int) {
 		s.rules[i].entries = make(map[string]*storedEntry)
 	}
 	s.bytes = 0
+	s.lastReplay = lastReplay
 	dropped := 0
 	for _, it := range items {
-		out, removed := s.insertLocked(it.rule, it.key, it.entry)
-		dropped += len(removed)
-		if out == outcomeTooLarge {
+		r := s.insertLocked(it.rule, it.key, it.entry)
+		dropped += len(r.removed)
+		if r.rejected != nil {
 			dropped++
 		}
 	}

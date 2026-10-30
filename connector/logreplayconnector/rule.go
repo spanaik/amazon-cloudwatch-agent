@@ -146,13 +146,9 @@ func validUTF8(s string) string {
 	return strings.ToValidUTF8(s, "\uFFFD")
 }
 
-// sourceFile returns the value of the source file attribute of a record,
-// and false when the attribute is configured but absent or empty. With no
-// source_file_attribute, it returns "" and true.
+// sourceFile returns the value of the source file attribute key of a
+// record, and false when the attribute is absent or empty.
 func sourceFile(lr plog.LogRecord, key string) (string, bool) {
-	if key == "" {
-		return "", true
-	}
 	v, ok := lr.Attributes().Get(key)
 	if !ok {
 		return "", false

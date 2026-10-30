@@ -275,9 +275,9 @@ func (t *telemetry) recordCounts(ctx context.Context, counts []ruleCounts) {
 }
 
 // recordRemovals adds the removals of one batch or tick, under the rule of
-// each removed entry. A new entry that was too large to store counts as
-// removed with the reason too_large.
-func (t *telemetry) recordRemovals(ctx context.Context, removed []removal, rejected []entryRef) {
+// each removed entry. A new entry that was not stored because of a state
+// limit counts as removed with the reason of that limit.
+func (t *telemetry) recordRemovals(ctx context.Context, removed, rejected []removal) {
 	if len(removed) == 0 && len(rejected) == 0 {
 		return
 	}
@@ -286,7 +286,7 @@ func (t *telemetry) recordRemovals(ctx context.Context, removed []removal, rejec
 		counts[r.rule][r.reason]++
 	}
 	for _, r := range rejected {
-		counts[r.rule][removeTooLarge]++
+		counts[r.rule][r.reason]++
 	}
 	for i := range counts {
 		for r := range numRemoveReasons {

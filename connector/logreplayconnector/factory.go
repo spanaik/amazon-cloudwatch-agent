@@ -30,10 +30,11 @@ func NewFactory() connector.Factory {
 
 func createDefaultConfig() component.Config {
 	return &Config{
-		Interval:       defaultInterval,
-		MaxStateBytes:  defaultMaxStateBytes,
-		MaxRecordBytes: defaultMaxRecordBytes,
-		ErrorMode:      defaultErrorMode,
+		Interval:            defaultInterval,
+		SourceFileAttribute: defaultSourceFile,
+		MaxStateBytes:       defaultMaxStateBytes,
+		MaxRecordBytes:      defaultMaxRecordBytes,
+		ErrorMode:           defaultErrorMode,
 	}
 }
 
