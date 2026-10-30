@@ -114,6 +114,7 @@ func TestComponents(t *testing.T) {
 	wantConnectors := []string{
 		"count",
 		"forward",
+		"log_replay",
 		"routing",
 		"signaltometrics",
 		"signal_to_metrics",
