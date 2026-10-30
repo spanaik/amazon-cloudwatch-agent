@@ -57,7 +57,8 @@ func maxRecordBytes(cfg *Config) int {
 // hook stays a no-op, and there is no store telemetry, as without storage.
 //
 // A failure to read the record is not an error either. The connector logs
-// it and starts with an empty state.
+// it and keeps the records in memory only for this run, so that its first
+// save does not replace a stored record that may still be valid.
 func (c *replayConnector) startPersistence(ctx context.Context, host component.Host) error {
 	client, err := statestore.GetClient(ctx, host, c.cfg.Storage, component.KindConnector, c.id)
 	if errors.Is(err, statestore.ErrExtensionNotFound) || errors.Is(err, statestore.ErrNotStorageExtension) {
@@ -83,12 +84,21 @@ func (c *replayConnector) startPersistence(ctx context.Context, host component.H
 		c.logStorageUnavailable(err)
 		return nil
 	}
-	if err := c.tel.registerStore(store.Stats); err != nil {
+	snap, found, err := store.Load(ctx)
+	if err != nil {
+		c.logger.Warn("Failed to read the stored log_replay state. The kept log records are in memory only until the next restart, so that the stored state is not replaced.",
+			zap.Error(err))
 		// The store owns the client, and Shutdown without Start closes it.
+		if err := store.Shutdown(ctx); err != nil {
+			c.logger.Debug("Failed to close the log_replay state storage", zap.Error(err))
+		}
+		return nil
+	}
+	if err := c.tel.registerStore(store.Stats); err != nil {
 		return errors.Join(fmt.Errorf("failed to create the state store telemetry: %w", err), store.Shutdown(ctx))
 	}
 	c.store = store
-	rewrite := c.restoreState(ctx)
+	rewrite := c.restoreState(ctx, snap, found)
 	// The collector starts a connector before the receivers of its logs
 	// pipeline, so ConsumeLogs does not run before Start returns, and the
 	// hook is in place for its first batch.
@@ -109,30 +119,23 @@ func (c *replayConnector) logStorageUnavailable(err error) {
 	)
 }
 
-// restoreState loads the stored record, keeps the entries that the current
+// restoreState keeps the entries of a loaded record that the current
 // configuration would keep, and replaces the state with them. It reports
 // whether the record needs a rewrite with the current state, which is the
 // case when there is no record, when the record is not usable, and when the
 // restore dropped or changed entries. The rewrite comes within Debounce, so
 // a corrupt record or one of another version is logged once, not at every
-// start.
-//
-// statestore logs a record that is corrupt or has another version, and Load
-// returns no record. A storage read error is logged here, and is not a
-// reason for a rewrite: the record can be valid and the error transient. In
-// these cases the state stays empty, and records come back only when their
-// sources log them again.
-func (c *replayConnector) restoreState(ctx context.Context) bool {
-	snap, found, err := c.store.Load(ctx)
-	if err != nil {
-		c.logger.Warn("Failed to read the stored log_replay state. Starting with an empty state.", zap.Error(err))
-		return false
-	}
+// start. statestore logs a record that is corrupt or has another version,
+// and Load returns no record.
+func (c *replayConnector) restoreState(ctx context.Context, snap stateSnapshot, found bool) bool {
 	if !found {
 		return true
 	}
 	items, res := c.checkSnapshot(ctx, &snap)
-	kept, dropped := c.state.restore(items)
+	// A time ahead of the clock (a clock step back) is now, so that it
+	// cannot hold back newer records or the next copies.
+	now := c.now().UnixNano()
+	kept, dropped := c.state.restore(items, max(0, min(snap.LastReplay, now)))
 	dropped += res.dropped
 	c.logger.Info("Restored the log_replay state",
 		zap.Int("kept", kept),
@@ -148,7 +151,7 @@ type checkResult struct {
 	// keep.
 	dropped int
 	// changed counts the entries whose source file changed with the
-	// configuration.
+	// configuration, or whose time was ahead of the clock.
 	changed int
 }
 
@@ -158,10 +161,12 @@ type checkResult struct {
 // exists and matches it, its identity resolves to the stored key, and its
 // source file is read again with the current source_file_attribute. An entry
 // whose record no longer has the source file attribute is dropped. A rule
-// condition that fails to evaluate drops the entry.
+// condition that fails to evaluate drops the entry. A time ahead of the
+// clock becomes the current time.
 func (c *replayConnector) checkSnapshot(ctx context.Context, snap *stateSnapshot) ([]restoredEntry, checkResult) {
 	var res checkResult
 	var items []restoredEntry
+	now := c.now().UnixNano()
 	for name, entries := range snap.Rules {
 		ri, ok := c.state.ruleIndex[name]
 		if !ok {
@@ -174,8 +179,9 @@ func (c *replayConnector) checkSnapshot(ctx context.Context, snap *stateSnapshot
 				res.dropped++
 				continue
 			}
-			if src != e.SourceFile {
+			if src != e.SourceFile || e.Time > now {
 				e.SourceFile = src
+				e.Time = min(e.Time, now)
 				res.changed++
 			}
 			items = append(items, restoredEntry{entryRef: entryRef{rule: ri, key: key}, entry: e})

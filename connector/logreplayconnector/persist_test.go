@@ -235,7 +235,10 @@ func TestPersistRestartFileStorage(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
 		dir := t.TempDir()
-		ld := mergeLogs(podLogs("p1", base, "app started version=1"), podLogs("p2", base, "app started version=2"))
+		// The bubble clock starts in 2000. The records are an hour older, so
+		// that the restore does not cap their times.
+		ts := time.Now().Add(-time.Hour)
+		ld := mergeLogs(podLogs("p1", ts, "app started version=1"), podLogs("p2", ts, "app started version=2"))
 
 		ext := startFileStorage(t, dir)
 		conn1, _ := newStorageConnector(t, testConfig(), consumertest.NewNop())
@@ -295,14 +298,16 @@ func TestPersistRestoreChecksEntries(t *testing.T) {
 		return ld
 	}
 	for _, tc := range []struct {
-		name   string
-		after  func(*Config)
-		want   []string
-		srcSet bool
+		name  string
+		after func(*Config)
+		want  []string
+		// src is the source file of the kept record of a pod, nil for
+		// podFile.
+		src func(pod string) string
 		// dropped and changed are the fields of the restore log.
 		dropped, changed int64
 	}{
-		{name: "same_configuration", after: func(*Config) {}, want: []string{"p1", "p2"}, srcSet: true},
+		{name: "same_configuration", after: func(*Config) {}, want: []string{"p1", "p2"}},
 		{
 			name:    "rule_renamed",
 			after:   func(c *Config) { c.Rules[0].Name = "other" },
@@ -312,14 +317,12 @@ func TestPersistRestoreChecksEntries(t *testing.T) {
 			name:    "body_contains_changed",
 			after:   func(c *Config) { c.Rules[0].BodyContains = []string{"big"} },
 			want:    []string{"p2"},
-			srcSet:  true,
 			dropped: 1,
 		},
 		{
 			name:    "condition_added",
 			after:   func(c *Config) { c.Rules[0].Conditions = []string{`attributes["log.iostream"] == "stdout"`} },
 			want:    []string{"p1"},
-			srcSet:  true,
 			dropped: 1,
 		},
 		{
@@ -328,9 +331,12 @@ func TestPersistRestoreChecksEntries(t *testing.T) {
 			dropped: 2,
 		},
 		{
-			name:    "source_file_attribute_removed",
-			after:   func(c *Config) { c.SourceFileAttribute = "" },
+			// Another attribute that both records have: the source file is
+			// read again from the record.
+			name:    "source_file_attribute_changed",
+			after:   func(c *Config) { c.SourceFileAttribute = "log.iostream" },
 			want:    []string{"p1", "p2"},
+			src:     func(pod string) string { return map[string]string{"p1": "stdout", "p2": "stderr"}[pod] },
 			changed: 2,
 		},
 		{
@@ -342,7 +348,6 @@ func TestPersistRestoreChecksEntries(t *testing.T) {
 			name:    "max_entries_lowered",
 			after:   func(c *Config) { c.Rules[0].MaxEntries = 1 },
 			want:    []string{"p2"},
-			srcSet:  true,
 			dropped: 1,
 		},
 		{
@@ -364,12 +369,12 @@ func TestPersistRestoreChecksEntries(t *testing.T) {
 			assert.Equal(t, tc.changed, fields["changed"])
 			pods := keptPods(t, conn)
 			assert.ElementsMatch(t, tc.want, pods)
+			src := tc.src
+			if src == nil {
+				src = podFile
+			}
 			for i, k := range conn.state.entries() {
-				if tc.srcSet {
-					assert.Equal(t, podFile(pods[i]), k.entry.SourceFile)
-				} else {
-					assert.Empty(t, k.entry.SourceFile)
-				}
+				assert.Equal(t, src(pods[i]), k.entry.SourceFile)
 			}
 			require.NoError(t, conn.Shutdown(t.Context()))
 			if tc.dropped > 0 || tc.changed > 0 {
@@ -449,18 +454,27 @@ func TestPersistNoRecordWritesOne(t *testing.T) {
 	})
 }
 
+// TestPersistGetError checks that a read error at start keeps the stored
+// record: the run keeps its records in memory only, so its changes and its
+// shutdown do not replace the record.
 func TestPersistGetError(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
 		m := newMemStorage()
+		m.client.put([]byte(`{"version":1,"data":{"rules":{}}}`))
 		m.client.getErr = errors.New("disk read failed")
 		conn, logs := newStorageConnector(t, testConfig(), consumertest.NewNop())
-		require.NoError(t, conn.Start(context.Background(), m.host()))
-		warns := logs.FilterMessage("Failed to read the stored log_replay state. Starting with an empty state.").All()
+		require.NoError(t, conn.Start(ctx, m.host()))
+		warns := logs.FilterMessage("Failed to read the stored log_replay state. The kept log records are in memory only until the next restart, so that the stored state is not replaced.").All()
 		require.Len(t, warns, 1)
+		assert.Nil(t, conn.store)
+		assert.Equal(t, 1, m.client.closes, "the client is closed")
+		require.NoError(t, conn.ConsumeLogs(ctx, podLogs("p1", base, "app started")))
+		assert.Len(t, conn.state.entries(), 1, "the records are kept in memory")
 		time.Sleep(10 * time.Minute)
 		synctest.Wait()
-		assert.Zero(t, m.client.setCount(), "a read error is not a reason to overwrite the record")
-		require.NoError(t, conn.Shutdown(context.Background()))
+		require.NoError(t, conn.Shutdown(ctx))
+		assert.Zero(t, m.client.setCount(), "nothing replaces the stored record")
 	})
 }
 
@@ -510,7 +524,7 @@ func TestPersistSavesChanges(t *testing.T) {
 		m := newMemStorage()
 		conn, _ := newStorageConnector(t, testConfig(), consumertest.NewNop())
 		files := newFakeFiles()
-		conn.statFile = files.stat
+		conn.checkSource = files.stat
 		require.NoError(t, conn.Start(ctx, m.host()))
 		time.Sleep(2 * time.Second)
 		synctest.Wait()
@@ -522,19 +536,30 @@ func TestPersistSavesChanges(t *testing.T) {
 		assert.Equal(t, sets+1, m.client.setCount(), "a change is saved within the debounce")
 		assert.Len(t, m.client.record(t).Rules["app_start"], 2)
 
-		// A tick that removes a record of a deleted pod saves too.
+		// A tick that removes a record of a deleted pod and sends the other
+		// saves both changes in one write: the removal and the time of the
+		// copies.
 		files.remove(podFile("p1"))
 		conn.tick(ctx)
 		time.Sleep(2 * time.Second)
 		synctest.Wait()
 		assert.Equal(t, sets+2, m.client.setCount())
-		assert.Len(t, m.client.record(t).Rules["app_start"], 1)
+		rec := m.client.record(t)
+		assert.Len(t, rec.Rules["app_start"], 1)
+		assert.Equal(t, testNow.UnixNano(), rec.LastReplay)
 
-		// A tick that only sends saves nothing.
+		// A tick that only sends saves the time of its copies.
+		conn.tick(ctx)
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		assert.Equal(t, sets+3, m.client.setCount())
+
+		// A tick whose send fails saves nothing.
+		conn.next = &errConsumer{err: errors.New("throttled")}
 		conn.tick(ctx)
 		time.Sleep(10 * time.Minute)
 		synctest.Wait()
-		assert.Equal(t, sets+2, m.client.setCount())
+		assert.Equal(t, sets+3, m.client.setCount())
 		require.NoError(t, conn.Shutdown(ctx))
 	})
 }
@@ -570,5 +595,63 @@ func TestPersistFullStateFits(t *testing.T) {
 		assert.Equal(t, uint64(0), conn.store.Stats().Rejected)
 		assert.Equal(t, uint64(0), conn.store.Stats().SaveErrors)
 		assert.Greater(t, conn.store.Stats().LastBytes, minMaxStateBytes/2)
+	})
+}
+
+// TestPersistRestoreCapsTimes checks that stored times ahead of the clock
+// (a clock that stepped back) come back as the current time, so that they
+// cannot hold back newer records or the next copies.
+func TestPersistRestoreCapsTimes(t *testing.T) {
+	m := newMemStorage()
+	future := testNow.Add(24 * time.Hour)
+	first, _ := newStorageConnector(t, testConfig(), consumertest.NewNop())
+	first.now = func() time.Time { return future.Add(time.Hour) }
+	require.NoError(t, first.Start(t.Context(), m.host()))
+	require.NoError(t, first.ConsumeLogs(t.Context(), podLogs("p1", future, "app started")))
+	first.tick(t.Context())
+	require.NoError(t, first.Shutdown(t.Context()))
+	require.Equal(t, future.Add(time.Hour).UnixNano(), m.client.record(t).LastReplay)
+
+	conn, logs := newStorageConnector(t, testConfig(), consumertest.NewNop())
+	require.NoError(t, conn.Start(t.Context(), m.host()))
+	fields := restoredLog(t, logs)
+	assert.Equal(t, int64(1), fields["changed"])
+	kept := conn.state.entries()
+	require.Len(t, kept, 1)
+	assert.Equal(t, testNow.UnixNano(), kept[0].entry.Time)
+	assert.Equal(t, testNow.UnixNano(), conn.state.lastReplayTime())
+	require.NoError(t, conn.Shutdown(t.Context()))
+}
+
+// TestPersistRestartWaitsForInterval checks that after a restart the first
+// tick comes one interval after the latest copies, not at the startup
+// delay, so that agent restarts do not add copies.
+func TestPersistRestartWaitsForInterval(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		m := newMemStorage()
+		ts := time.Now().Add(-time.Hour)
+		first, _ := newStorageConnector(t, testConfig(), consumertest.NewNop())
+		first.now = time.Now
+		require.NoError(t, first.Start(ctx, m.host()))
+		require.NoError(t, first.ConsumeLogs(ctx, podLogs("p1", ts, "app started")))
+		time.Sleep(startupReplayDelay)
+		synctest.Wait()
+		require.NoError(t, first.Shutdown(ctx))
+		lastCopies := time.Now()
+
+		// Restart 5 minutes later.
+		time.Sleep(5 * time.Minute)
+		sink := new(consumertest.LogsSink)
+		conn, _ := newStorageConnector(t, testConfig(), sink)
+		conn.now = time.Now
+		require.NoError(t, conn.Start(ctx, m.host()))
+		time.Sleep(time.Until(lastCopies.Add(time.Hour)) - time.Nanosecond)
+		synctest.Wait()
+		assert.Empty(t, sink.AllLogs(), "no copies before one interval after the latest ones")
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		assert.Len(t, sink.AllLogs(), 1)
+		require.NoError(t, conn.Shutdown(ctx))
 	})
 }

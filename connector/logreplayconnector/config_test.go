@@ -22,10 +22,11 @@ import (
 func TestCreateDefaultConfig(t *testing.T) {
 	cfg := createDefaultConfig().(*Config)
 	assert.Equal(t, &Config{
-		Interval:       time.Hour,
-		MaxStateBytes:  4 << 20,
-		MaxRecordBytes: 64 << 10,
-		ErrorMode:      ottl.IgnoreError,
+		Interval:            time.Hour,
+		SourceFileAttribute: "log.file.path",
+		MaxStateBytes:       4 << 20,
+		MaxRecordBytes:      64 << 10,
+		ErrorMode:           ottl.IgnoreError,
 	}, cfg)
 	assert.ErrorContains(t, xconfmap.Validate(cfg), "at least one rule must be configured")
 }
@@ -42,11 +43,12 @@ func TestLoadConfig(t *testing.T) {
 		{
 			id: component.MustNewID(TypeStr),
 			want: &Config{
-				Interval:       time.Hour,
-				MaxStateBytes:  4 << 20,
-				MaxRecordBytes: 64 << 10,
-				ErrorMode:      ottl.IgnoreError,
-				Rules:          []RuleConfig{{Name: "app_start", BodyContains: []string{"app started"}, Identity: []string{"k8s.pod.uid"}}},
+				Interval:            time.Hour,
+				SourceFileAttribute: "log.file.path",
+				MaxStateBytes:       4 << 20,
+				MaxRecordBytes:      64 << 10,
+				ErrorMode:           ottl.IgnoreError,
+				Rules:               []RuleConfig{{Name: "app_start", BodyContains: []string{"app started"}, Identity: []string{"k8s.pod.uid"}}},
 			},
 		},
 		{
@@ -102,6 +104,11 @@ func TestValidate(t *testing.T) {
 			name:   "interval_too_long",
 			modify: func(c *Config) { c.Interval = 25 * time.Hour },
 			errs:   []string{"interval must be between 1m0s and 24h0m0s, got 25h0m0s"},
+		},
+		{
+			name:   "no_source_file_attribute",
+			modify: func(c *Config) { c.SourceFileAttribute = "" },
+			errs:   []string{"source_file_attribute must not be empty"},
 		},
 		{
 			name:   "state_bytes",

@@ -24,7 +24,7 @@ record with its other exporters.
 | Key | Default | Description |
 | --- | --- | --- |
 | `interval` | `1h` | How often a copy of each kept record is sent. From `1m` to `24h`. |
-| `source_file_attribute` | none | A log record attribute with the path of the file that the record came from, for example `log.file.path`. If it is set, a record without it is not kept. At each tick, a kept record whose file no longer exists is removed instead of sent. |
+| `source_file_attribute` | `log.file.path` | A log record attribute with the path of the file that the record came from. A record without it is not kept. At each tick, a kept record whose file no longer exists is removed instead of sent. The file is the only sign that the source of a record stopped, so the key must not be empty. The filelog receiver sets `log.file.path` with `include_file_path: true`. |
 | `storage` | none | The ID of a storage extension, for example `file_storage/state`. With it, the kept records survive a restart. |
 | `max_state_bytes` | `4194304` (4 MiB) | The size of all kept records together. From 64 KiB to 64 MiB. |
 | `max_record_bytes` | `65536` (64 KiB) | The size of one kept record, as OTLP JSON with its resource and scope. A larger record is not kept. From 1 KiB to 1 MiB, and at most `max_state_bytes`. |
@@ -84,9 +84,9 @@ The copies go to the same exporter as the original records. So, if the exporter 
 lands in the same place as the original record.
 
 The kubelet writes the log of each container to `/var/log/pods`, and it adds a symbolic link to that file in
-`/var/log/containers`. When the kubelet removes a container, it removes the link too. Thus, with
-`source_file_attribute: log.file.path`, the copies of a container stop within one interval after the kubelet removes
-the container. A new pod with the name of a previous pod is the same entity: its startup line replaces the kept
+`/var/log/containers`. When the kubelet removes a container, it removes the link too. Thus, the copies of a container
+stop within one interval after the kubelet removes the container. The connector checks the link itself, not its
+target, because the target is missing for a moment while the kubelet rotates the log. A new pod with the name of a previous pod is the same entity: its startup line replaces the kept
 record of the previous pod.
 
 A reader cannot tell a copy from the original record by its content. The start time of the pod gives the start time of the
@@ -98,13 +98,16 @@ engine.
 
 For each record and rule, the connector first does the `body_contains` check. Most records fail this check, and the
 check does not allocate. Then it evaluates the conditions. To be kept, a matching record must have a value that is
-not empty for every identity attribute of its resource. With `source_file_attribute`, the record must also have that
-attribute.
+not empty for every identity attribute of its resource. The record must also have the source file attribute.
 
 The connector keeps a copy of the record with its resource and its scope. The newest record of an entity is its kept record.
 A new record with the same time as the kept record also replaces it. The time of a record is its timestamp, else its observed timestamp, else the
 current time. A time later than the current time counts as the current time. Within one batch, the last matching
-record of an entity wins. One record can match more than one rule, and each rule keeps it.
+record of an entity wins. One record can match more than one rule, and each rule keeps it. A newer matching record
+that is larger than `max_record_bytes` is not kept, and it removes the kept record of its entity, which is stale.
+
+Each change of the kept records rewrites the whole stored state, at most one time each second. So a rule must match
+rare records, such as a startup line.
 
 The connector does not change its input, so the pipeline does not copy the data for it.
 
@@ -112,16 +115,22 @@ The connector does not change its input, so the pipeline does not copy the data 
 
 The first tick comes 10 seconds after the start, plus a random delay of less than 10 seconds and less than the
 interval. The random delay spreads the ticks of agents that start at the same time. After the first tick, a tick
-comes at each interval. A record kept between two ticks gets its first copy at the next tick.
+comes at each interval. A record kept between two ticks gets its first copy at the next tick. With `storage`, the
+stored state holds the time of the latest copies. After a restart, the first tick waits until one interval after
+them. Thus, a restart does not add copies.
 
-At each tick, the connector checks the source file of each kept record that has one:
+At each tick, the connector checks the source file of each kept record. It uses `lstat`. Thus, a symbolic link
+counts as present, also with a missing target:
 
-- If the file does not exist, the connector removes the record and does not send it.
+- If the file does not exist, the connector checks it again after one second. A rotation that renames a file and
+  then makes a new one leaves it missing for a moment. If the file is still missing, the connector removes the
+  record and does not send it.
 - If the connector cannot check the file for another reason, for example a missing permission, it does not send the
   record. The record stays kept for the next tick.
 
-The connector sends all other records in one call to the next consumer, sorted by rule and then by identity. If the
-next consumer returns an error, the connector logs it at most one time each minute. The error does not go back to
+The connector sends all other records to the next consumer, sorted by rule and then by identity. Each call holds
+at most 1 MiB of records. A record larger than 1 MiB goes alone. If the next consumer returns an error, the connector
+logs it at most one time each minute. The error does not go back to
 the logs pipeline that feeds the connector, and the records stay kept for the next tick. At shutdown, the connector
 stops the ticks and waits for a tick in progress until the shutdown deadline.
 
@@ -129,26 +138,29 @@ stops the ticks and waits for a tick in progress until the shutdown deadline.
 
 If `storage` is set, the connector keeps its records in the storage extension. The stored state is one JSON record
 with the key `state` and the version `1`. The connector reads it one time at startup, and after that only writes it, within about
-one second after a change. A change is a new, replaced, or removed record. A tick that only sends copies writes
-nothing.
+one second after a change. A change is a new, replaced, or removed record, and a tick whose copies the next
+consumer accepted. The stored state holds the time of that tick, for the first tick after a restart.
 
 At startup, the connector checks each stored record against the current configuration. It restores only the records
 that pass all of these checks:
 
 - The rule of the record still exists, and the record matches it.
 - The identity of the record is the same.
-- If `source_file_attribute` is set, the record has that attribute.
+- The record has the source file attribute.
 - The record fits `max_record_bytes`.
 
-The first tick after a restart sends the copies of the restored records.
+A stored time later than the current time counts as the current time. The first tick after a restart sends the
+copies of the restored records.
 
 If the storage extension does not exist or is not a storage extension, the connector does not start. If the
-extension cannot open its storage, the connector logs one Error and keeps the records in memory only.
+extension cannot open its storage, the connector logs one Error and keeps the records in memory only. If the
+connector cannot read the stored state, it logs a Warn and keeps the records in memory only until the next restart.
+Thus, the stored state stays for the next start.
 
 ### Limits
 
 If a rule already keeps `max_entries` records, a new record of the rule removes the rule's record with the oldest
-time. If the kept records are larger than `max_state_bytes`, the connector removes the records with the oldest time,
+time. A new record that is older than all kept records of the rule is not stored. If the kept records are larger than `max_state_bytes`, the connector removes the records with the oldest time,
 of any rule. It never removes the new record. The size of a kept record is the size of its JSON form in the
 stored state.
 
@@ -175,6 +187,7 @@ metrics.
   matching record larger than `max_record_bytes`, a source file that cannot be checked, and an error of the next
   consumer.
 - Error, one time at startup: the storage cannot open.
+- Warn, one time at startup: the stored state cannot be read.
 - Info, one time at startup with `storage`: the number of restored, dropped, and changed records.
 - Other logs about single records are at the Debug level. With `error_mode: ignore`, OTTL logs each evaluation error
   of a condition at the Warn level.

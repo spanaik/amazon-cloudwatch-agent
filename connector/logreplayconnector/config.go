@@ -19,6 +19,7 @@ import (
 // Connector-level defaults.
 const (
 	defaultInterval       = time.Hour
+	defaultSourceFile     = "log.file.path"
 	defaultMaxStateBytes  = 4 << 20  // 4 MiB
 	defaultMaxRecordBytes = 64 << 10 // 64 KiB
 	defaultErrorMode      = ottl.IgnoreError
@@ -56,10 +57,11 @@ type Config struct {
 	// Interval is how often a copy of each kept record is sent.
 	Interval time.Duration `mapstructure:"interval"`
 	// SourceFileAttribute is the key of a log record attribute that holds
-	// the path of the file that the record was read from, for example
-	// log.file.path. When it is set, a record without this attribute is
-	// not kept, and a kept record whose file no longer exists is removed
-	// instead of sent.
+	// the path of the file that the record was read from. A record without
+	// this attribute is not kept, and a kept record whose file no longer
+	// exists is removed instead of sent. The file is the only sign that the
+	// source of a record stopped, so it is required. The default is
+	// log.file.path, which the filelog receiver sets with include_file_path.
 	SourceFileAttribute string `mapstructure:"source_file_attribute"`
 	// MaxStateBytes bounds the size of all kept records together.
 	MaxStateBytes int `mapstructure:"max_state_bytes"`
@@ -111,6 +113,10 @@ func (cfg *Config) Validate() error {
 	if !inRange(cfg.Interval, minInterval, maxInterval) {
 		errs = append(errs, fmt.Errorf("interval must be between %s and %s, got %s",
 			minInterval, maxInterval, cfg.Interval))
+	}
+	if cfg.SourceFileAttribute == "" {
+		errs = append(errs, errors.New("source_file_attribute must not be empty: the connector removes a kept record "+
+			"when its source file is gone, and it has no other sign that the source stopped"))
 	}
 	if !inRange(cfg.MaxStateBytes, minMaxStateBytes, maxMaxStateBytes) {
 		errs = append(errs, fmt.Errorf("max_state_bytes must be between %d and %d, got %d",

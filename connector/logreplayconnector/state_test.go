@@ -60,9 +60,9 @@ func TestStateTooLarge(t *testing.T) {
 	s := newState(twoRuleSpecs(100), minMaxStateBytes)
 	res := s.applyBatch([]observation{obs(0, "p1", 10, minMaxStateBytes)})
 	assert.Equal(t, 1, res.counts[outcomeTooLarge])
-	assert.Equal(t, []entryRef{{rule: 0, key: podKey("p1")}}, res.rejected)
+	assert.Equal(t, []removal{{entryRef: entryRef{rule: 0, key: podKey("p1")}, reason: removeTooLarge}}, res.rejected)
 	assert.Empty(t, s.entries())
-	assert.True(t, res.changed())
+	assert.False(t, res.changed(), "nothing was stored or removed")
 
 	// A record that makes a kept entry too large removes it, because the
 	// kept record is stale.
@@ -177,7 +177,7 @@ func TestStateRestoreKeepsMostRecent(t *testing.T) {
 			entry:    entry{Identity: o.identity, Record: o.record, Time: o.time},
 		})
 	}
-	kept, dropped := s.restore(items)
+	kept, dropped := s.restore(items, 42)
 	assert.Equal(t, 3, kept)
 	assert.Equal(t, 1, dropped)
 	assert.ElementsMatch(t, []string{podKey("p1"), podKey("p3")}, keys(s, 0), "the restore replaces the state and keeps the most recent")
@@ -191,4 +191,55 @@ func TestStateSnapshot(t *testing.T) {
 	snap := s.snapshot()
 	require.Len(t, snap.Rules, 1)
 	assert.Equal(t, int64(10), snap.Rules["b"][podKey("p1")].Time)
+}
+
+// TestStateMaxEntriesRejectsOlder checks that a full rule does not evict a
+// newer record for an older one, because the rule keeps the latest records.
+func TestStateMaxEntriesRejectsOlder(t *testing.T) {
+	s := newState(twoRuleSpecs(2), maxMaxStateBytes)
+	s.applyBatch([]observation{obs(0, "p1", 10, 1), obs(0, "p2", 20, 1)})
+	res := s.applyBatch([]observation{obs(0, "p0", 5, 1)})
+	assert.Equal(t, 1, res.counts[outcomeOverLimit])
+	assert.Empty(t, res.removed)
+	assert.Equal(t, []removal{{entryRef: entryRef{rule: 0, key: podKey("p0")}, reason: removeMaxEntries}}, res.rejected)
+	assert.False(t, res.changed())
+	assert.ElementsMatch(t, []string{podKey("p1"), podKey("p2")}, keys(s, 0))
+
+	// A record as old as the oldest kept one evicts it.
+	res = s.applyBatch([]observation{obs(0, "p3", 10, 1)})
+	assert.Equal(t, []removal{{entryRef: entryRef{rule: 0, key: podKey("p1")}, reason: removeMaxEntries}}, res.removed)
+	assert.ElementsMatch(t, []string{podKey("p2"), podKey("p3")}, keys(s, 0))
+}
+
+func TestStateTooLargeObservation(t *testing.T) {
+	s := newState(twoRuleSpecs(10), maxMaxStateBytes)
+	s.applyBatch([]observation{obs(0, "p1", 10, 1)})
+	big := func(t int64) observation {
+		return observation{rule: 0, key: podKey("p1"), time: t, tooLarge: true}
+	}
+	// An older record that is too large leaves the newer kept one.
+	res := s.applyBatch([]observation{big(9)})
+	assert.Equal(t, 1, res.counts[outcomeTooLarge])
+	assert.Empty(t, res.removed)
+	assert.Len(t, s.entries(), 1)
+	// A newer one removes it, because it is stale.
+	res = s.applyBatch([]observation{big(11)})
+	assert.Equal(t, []removal{{entryRef: entryRef{rule: 0, key: podKey("p1")}, reason: removeTooLarge}}, res.removed)
+	assert.Empty(t, s.entries())
+	assert.True(t, res.changed())
+	// With no kept record, nothing changes.
+	res = s.applyBatch([]observation{big(12)})
+	assert.Empty(t, res.removed)
+	assert.Empty(t, res.rejected)
+	assert.False(t, res.changed())
+}
+
+func TestStateLastReplay(t *testing.T) {
+	s := newState(twoRuleSpecs(10), maxMaxStateBytes)
+	assert.Zero(t, s.lastReplayTime())
+	assert.Zero(t, s.snapshot().LastReplay)
+	s.setLastReplay(7)
+	assert.Equal(t, int64(7), s.snapshot().LastReplay)
+	s.restore(nil, 3)
+	assert.Equal(t, int64(3), s.lastReplayTime())
 }

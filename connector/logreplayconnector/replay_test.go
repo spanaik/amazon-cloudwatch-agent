@@ -6,7 +6,12 @@ package logreplayconnector
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -135,7 +140,7 @@ func TestReplaySourceGone(t *testing.T) {
 	sink := new(consumertest.LogsSink)
 	conn, logs := newTestConnector(t, testConfig(), sink)
 	files := newFakeFiles()
-	conn.statFile = files.stat
+	conn.checkSource = files.stat
 	changes := 0
 	conn.changed = func() { changes++ }
 	ld := mergeLogs(podLogs("p1", base, "app started"), podLogs("p2", base, "app started"))
@@ -147,7 +152,7 @@ func TestReplaySourceGone(t *testing.T) {
 	require.Len(t, sink.AllLogs(), 1)
 	requireLogsEqual(t, copyOf(ld, 1, 0, testNow), sink.AllLogs()[0])
 	assert.Equal(t, []string{podKey("p2")}, keys(conn.state, 0), "the entry of the deleted pod is removed")
-	assert.Equal(t, 1, changes)
+	assert.Equal(t, 2, changes, "the removal and the time of the copies")
 	removed := logs.FilterMessage("Removed kept log records").All()
 	require.Len(t, removed, 1)
 	assert.Equal(t, zapcore.DebugLevel, removed[0].Level)
@@ -157,7 +162,7 @@ func TestReplaySourceGone(t *testing.T) {
 	files.remove(podFile("p2"))
 	conn.tick(t.Context())
 	assert.Len(t, sink.AllLogs(), 1, "nothing left to send")
-	assert.Equal(t, 1, files.count(podFile("p1")))
+	assert.Equal(t, 2, files.count(podFile("p1")), "a missing file is checked twice")
 	assert.Empty(t, conn.state.entries())
 }
 
@@ -165,7 +170,7 @@ func TestReplaySourceCheckError(t *testing.T) {
 	sink := new(consumertest.LogsSink)
 	conn, logs := newTestConnector(t, testConfig(), sink)
 	files := newFakeFiles()
-	conn.statFile = files.stat
+	conn.checkSource = files.stat
 	require.NoError(t, conn.ConsumeLogs(t.Context(), podLogs("p1", base, "app started")))
 
 	files.setErr(podFile("p1"), &fs.PathError{Op: "stat", Path: podFile("p1"), Err: fs.ErrPermission})
@@ -279,8 +284,138 @@ func TestSetTimes(t *testing.T) {
 	assert.Equal(t, 3, n)
 }
 
-func TestStatFile(t *testing.T) {
+// TestLstatFile checks the source check on real files: a symbolic link
+// whose target is missing still exists, as during a kubelet log rotation,
+// and a removed link does not.
+func TestLstatFile(t *testing.T) {
 	dir := t.TempDir()
-	assert.ErrorIs(t, statFile(dir+"/missing.log"), fs.ErrNotExist)
-	assert.NoError(t, statFile(dir))
+	target := filepath.Join(dir, "0.log")
+	link := filepath.Join(dir, "pod_ns_app-1.log")
+	require.NoError(t, os.WriteFile(target, []byte("x\n"), 0o600))
+	if err := os.Symlink(target, link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symbolic links need a privilege on Windows: %v", err)
+		}
+		require.NoError(t, err)
+	}
+	assert.NoError(t, lstatFile(link))
+	require.NoError(t, os.Remove(target))
+	assert.NoError(t, lstatFile(link), "a dangling link still exists")
+	require.NoError(t, os.Remove(link))
+	assert.ErrorIs(t, lstatFile(link), fs.ErrNotExist)
+	assert.NoError(t, lstatFile(dir))
+}
+
+// TestReplaySourceRotation checks that a source file that is missing at the
+// first check and back at the second, as during a log rotation that
+// renames the file and then creates a new one, keeps its record.
+func TestReplaySourceRotation(t *testing.T) {
+	sink := new(consumertest.LogsSink)
+	conn, _ := newTestConnector(t, testConfig(), sink)
+	calls := 0
+	conn.checkSource = func(path string) error {
+		calls++
+		if calls == 1 {
+			return &fs.PathError{Op: "lstat", Path: path, Err: fs.ErrNotExist}
+		}
+		return nil
+	}
+	ld := podLogs("p1", base, "app started")
+	require.NoError(t, conn.ConsumeLogs(t.Context(), ld))
+	conn.tick(t.Context())
+	assert.Equal(t, 2, calls)
+	assert.Len(t, conn.state.entries(), 1)
+	require.Len(t, sink.AllLogs(), 1)
+	requireLogsEqual(t, copyOf(ld, 0, 0, testNow), sink.AllLogs()[0])
+}
+
+// TestReplayRecheckWaits checks that the second check of a missing file
+// comes sourceRecheckDelay after the first, and that a shutdown during the
+// wait removes nothing.
+func TestReplayRecheckWaits(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn, _ := newTestConnector(t, testConfig(), new(consumertest.LogsSink))
+		conn.recheckDelay = sourceRecheckDelay
+		var checks []time.Time
+		conn.checkSource = func(path string) error {
+			checks = append(checks, time.Now())
+			return &fs.PathError{Op: "lstat", Path: path, Err: fs.ErrNotExist}
+		}
+		require.NoError(t, conn.ConsumeLogs(context.Background(), podLogs("p1", base, "app started")))
+		conn.tick(context.Background())
+		require.Len(t, checks, 2)
+		assert.Equal(t, sourceRecheckDelay, checks[1].Sub(checks[0]))
+		assert.Empty(t, conn.state.entries())
+
+		require.NoError(t, conn.ConsumeLogs(context.Background(), podLogs("p2", base, "app started")))
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(sourceRecheckDelay / 2)
+			cancel()
+		}()
+		conn.tick(ctx)
+		assert.Len(t, conn.state.entries(), 1, "a canceled wait removes nothing")
+	})
+}
+
+// TestReplayChunks checks that one tick sends at most maxSendBytes of kept
+// records per call, in order, and every record one time.
+func TestReplayChunks(t *testing.T) {
+	sink := new(consumertest.LogsSink)
+	conn, _ := newTestConnector(t, testConfig(), sink)
+	pad := strings.Repeat("x", 60<<10)
+	var lds []plog.Logs
+	for i := range 40 {
+		lds = append(lds, podLogs(fmt.Sprintf("p%02d", i), base, "app started "+pad))
+	}
+	require.NoError(t, conn.ConsumeLogs(t.Context(), mergeLogs(lds...)))
+	kept := conn.state.entries()
+	require.Len(t, kept, 40)
+	conn.tick(t.Context())
+
+	calls := sink.AllLogs()
+	require.Greater(t, len(calls), 1)
+	var pods []string
+	for i, ld := range calls {
+		size := 0
+		for _, rl := range ld.ResourceLogs().All() {
+			pod, _ := rl.Resource().Attributes().Get("k8s.pod.name")
+			pods = append(pods, pod.Str())
+		}
+		for _, k := range kept[len(pods)-ld.ResourceLogs().Len() : len(pods)] {
+			size += len(k.entry.Record)
+		}
+		assert.LessOrEqual(t, size, maxSendBytes, "call %d", i)
+	}
+	want := make([]string, 40)
+	for i := range want {
+		want[i] = fmt.Sprintf("p%02d", i)
+	}
+	assert.Equal(t, want, pods, "every record one time, in state order")
+}
+
+func TestFirstDelay(t *testing.T) {
+	conn, _ := newTestConnector(t, testConfig(), consumertest.NewNop())
+	conn.jitter = func(time.Duration) time.Duration { return 3 * time.Second }
+	startup := startupReplayDelay + 3*time.Second
+	for _, tc := range []struct {
+		name string
+		last time.Time
+		want time.Duration
+	}{
+		{name: "no_copies_yet", want: startup},
+		{name: "copies_5m_ago", last: testNow.Add(-5 * time.Minute), want: 55 * time.Minute},
+		{name: "due_in_the_startup_delay", last: testNow.Add(-time.Hour + time.Second), want: startup},
+		{name: "copies_2h_ago", last: testNow.Add(-2 * time.Hour), want: startup},
+		{name: "copies_ahead_of_the_clock", last: testNow.Add(3 * time.Hour), want: time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			last := int64(0)
+			if !tc.last.IsZero() {
+				last = tc.last.UnixNano()
+			}
+			conn.state.setLastReplay(last)
+			assert.Equal(t, tc.want, conn.firstDelay())
+		})
+	}
 }

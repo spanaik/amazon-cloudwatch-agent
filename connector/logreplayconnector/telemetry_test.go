@@ -46,7 +46,8 @@ func newTelemetryConnector(t *testing.T, cfg *Config, next consumer.Logs) (*repl
 	conn, err := newConnector(set, cfg, next)
 	require.NoError(t, err)
 	conn.now = func() time.Time { return testNow }
-	conn.statFile = func(string) error { return nil }
+	conn.checkSource = func(string) error { return nil }
+	conn.recheckDelay = 0
 	return conn, tel
 }
 
@@ -98,7 +99,7 @@ func TestTelemetry(t *testing.T) {
 	next := &errConsumer{}
 	conn, tel := newTelemetryConnector(t, cfg, next)
 	files := newFakeFiles()
-	conn.statFile = files.stat
+	conn.checkSource = files.stat
 	ctx := t.Context()
 
 	ld := mergeLogs(

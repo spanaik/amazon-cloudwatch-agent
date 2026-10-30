@@ -4,6 +4,7 @@
 package logreplayconnector
 
 import (
+	"bytes"
 	"io/fs"
 	"maps"
 	"slices"
@@ -57,12 +58,13 @@ func newTestConnector(t testing.TB, cfg *Config, next consumer.Logs) (*replayCon
 	conn, err := newConnector(set, cfg, next)
 	require.NoError(t, err)
 	conn.now = func() time.Time { return testNow }
-	conn.statFile = func(string) error { return nil }
+	conn.checkSource = func(string) error { return nil }
+	conn.recheckDelay = 0
 	conn.jitter = func(time.Duration) time.Duration { return 0 }
 	return conn, logs
 }
 
-// fakeFiles answers statFile for a set of paths. A path is present unless
+// fakeFiles answers checkSource for a set of paths. A path is present unless
 // it was removed or given an error.
 type fakeFiles struct {
 	mu   sync.Mutex
@@ -201,14 +203,25 @@ func mergeLogs(lds ...plog.Logs) plog.Logs {
 	return out
 }
 
-// requireLogsEqual compares two Logs as OTLP JSON.
+// requireLogsEqual compares two Logs as OTLP protobuf, so that a value
+// that JSON cannot show (for example a byte slice or a float bit pattern)
+// counts. On a difference, it shows both as JSON.
 func requireLogsEqual(t testing.TB, want, got plog.Logs) {
 	t.Helper()
-	w, err := jsonMarshaler.MarshalLogs(want)
+	var proto plog.ProtoMarshaler
+	w, err := proto.MarshalLogs(want)
 	require.NoError(t, err)
-	g, err := jsonMarshaler.MarshalLogs(got)
+	g, err := proto.MarshalLogs(got)
 	require.NoError(t, err)
-	require.JSONEq(t, string(w), string(g))
+	if bytes.Equal(w, g) {
+		return
+	}
+	wj, err := jsonMarshaler.MarshalLogs(want)
+	require.NoError(t, err)
+	gj, err := jsonMarshaler.MarshalLogs(got)
+	require.NoError(t, err)
+	require.JSONEq(t, string(wj), string(gj))
+	require.Fail(t, "the logs differ as protobuf but not as JSON")
 }
 
 // keys returns the state keys of a rule, sorted.

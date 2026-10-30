@@ -4,10 +4,13 @@
 package logreplayconnector
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"io/fs"
 	"math/rand/v2"
+	"os"
+	"slices"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -23,27 +26,61 @@ const scopeName = "github.com/aws/amazon-cloudwatch-agent/connector/logreplaycon
 // [0, min(interval, maxStartupJitter)) after Start. After a restart, the
 // first tick sends the restored records, so the delay lets the exporters of
 // the next pipeline connect first, and the jitter spreads the ticks of the
-// agents of a cluster that start together.
+// agents of a cluster that start together. If the restored state holds the
+// time of the latest copies, the first tick waits until one interval after
+// them instead.
 const (
 	startupReplayDelay = 10 * time.Second
 	maxStartupJitter   = 10 * time.Second
 )
+
+// sourceRecheckDelay is the time between the two checks of a source file
+// that is missing. A log rotation that renames the file and then creates a
+// new one leaves it missing for a moment.
+const sourceRecheckDelay = time.Second
+
+// maxSendBytes bounds the size of the kept records in one call to the next
+// consumer, so that a large state goes out in several calls. A record
+// larger than this goes out alone.
+const maxSendBytes = 1 << 20
 
 // randomJitter returns a random duration in [0, n). n must be positive.
 func randomJitter(n time.Duration) time.Duration {
 	return rand.N(n) //nolint:gosec // G404: a start jitter does not need a secure random source.
 }
 
+// lstatFile returns nil when path exists. A symbolic link counts as
+// existing, also when its target is missing. The kubelet removes the link in
+// /var/log/containers when it removes the container. While it rotates the
+// container log, the target of the link is missing for a moment.
+func lstatFile(path string) error {
+	_, err := os.Lstat(path)
+	return err
+}
+
 // startReplaying launches the replay goroutine and returns at once.
 func (c *replayConnector) startReplaying() {
 	ctx, cancel := context.WithCancel(context.Background())
-	delay := c.startupDelay + c.jitter(min(c.cfg.Interval, maxStartupJitter))
+	delay := c.firstDelay()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		c.run(ctx, delay)
 	}()
 	c.stopReplay, c.replayDone = cancel, done
+}
+
+// firstDelay returns the time from Start to the first tick: the startup
+// delay plus the jitter, or, when the restored state says when the latest
+// copies went out, one interval after them if that is later. The delay is
+// at most one interval, also when the stored time is ahead of the clock.
+func (c *replayConnector) firstDelay() time.Duration {
+	delay := c.startupDelay + c.jitter(min(c.cfg.Interval, maxStartupJitter))
+	if last := c.state.lastReplayTime(); last > 0 {
+		due := time.Duration(last + c.cfg.Interval.Nanoseconds() - c.now().UnixNano())
+		delay = max(delay, min(due, c.cfg.Interval))
+	}
+	return delay
 }
 
 // cancelReplaying cancels the context of the replay and returns at once. It
@@ -89,37 +126,39 @@ func (c *replayConnector) run(ctx context.Context, delay time.Duration) {
 	}
 }
 
-// tick sends a copy of every kept record whose source file still exists, in
-// one call to the next consumer, and removes the records whose source file
-// is gone. The entries are copied under the state lock, and the files are
-// checked and the copies built and sent without it. An empty state sends
-// nothing.
+// chunk is one call to the next consumer, with the number of copies of
+// each rule in it.
+type chunk struct {
+	ld   plog.Logs
+	sent []int64
+}
+
+// tick removes the kept records whose source file is gone, and sends a copy
+// of every other kept record, in calls of at most maxSendBytes of records.
+// The entries are copied under the state lock, and the files are checked
+// and the copies built and sent without it. An empty state sends nothing.
+// When every call succeeds, the tick time is stored as the time of the
+// latest copies.
 func (c *replayConnector) tick(ctx context.Context) {
 	kept := c.state.entries()
 	if len(kept) == 0 {
 		return
 	}
+	live, gone, skipped := c.checkSources(ctx, kept)
+	if ctx.Err() != nil {
+		return
+	}
+	if removed := c.state.removeGone(gone); len(removed) > 0 {
+		c.changed()
+		c.tel.recordRemovals(ctx, removed, nil)
+		c.logRemovals(removed, nil)
+	}
+
 	ts := pcommon.NewTimestampFromTime(c.now())
-	out := plog.NewLogs()
-	sent := make([]int64, len(c.rules))
-	var gone []keptEntry
-	var skipped []skip
-	for i := range kept {
-		k := &kept[i]
-		if k.entry.SourceFile != "" {
-			if err := c.statFile(k.entry.SourceFile); err != nil {
-				if errors.Is(err, fs.ErrNotExist) {
-					gone = append(gone, *k)
-				} else {
-					// The record is not sent, because the connector cannot
-					// tell whether its source still exists. It stays kept
-					// for the next tick.
-					skipped = append(skipped, skip{rule: k.rule, reason: skipSourceCheckError})
-					c.logSourceError(c.rules[k.rule].cfg.Name, k.entry.SourceFile, err)
-				}
-				continue
-			}
-		}
+	var chunks []chunk
+	size := 0
+	for i := range live {
+		k := &live[i]
 		ld, err := decodeRecord(k.entry.Record)
 		if err != nil {
 			// Not expected: the connector encoded the record, and the
@@ -130,32 +169,83 @@ func (c *replayConnector) tick(ctx context.Context) {
 			}
 			continue
 		}
+		if len(chunks) == 0 || (size > 0 && size+len(k.entry.Record) > maxSendBytes) {
+			chunks = append(chunks, chunk{ld: plog.NewLogs(), sent: make([]int64, len(c.rules))})
+			size = 0
+		}
+		cur := &chunks[len(chunks)-1]
 		setTimes(ld, ts)
-		ld.ResourceLogs().MoveAndAppendTo(out.ResourceLogs())
-		sent[k.rule]++
-	}
-
-	if removed := c.state.removeGone(gone); len(removed) > 0 {
-		c.changed()
-		c.tel.recordRemovals(ctx, removed, nil)
-		c.logRemovals(removed, 0)
+		ld.ResourceLogs().MoveAndAppendTo(cur.ld.ResourceLogs())
+		cur.sent[k.rule]++
+		size += len(k.entry.Record)
 	}
 	c.tel.recordSkipped(ctx, skipped)
+	if len(chunks) == 0 {
+		return
+	}
 
-	if out.LogRecordCount() == 0 {
-		return
-	}
-	err := c.next.ConsumeLogs(ctx, out)
-	if err != nil && ctx.Err() != nil {
-		if ce := c.logger.Check(zap.DebugLevel, "Log record copies not sent: the replay was canceled"); ce != nil {
-			ce.Write(zap.Error(err))
+	ok := true
+	for i := range chunks {
+		err := c.next.ConsumeLogs(ctx, chunks[i].ld)
+		if err != nil && ctx.Err() != nil {
+			if ce := c.logger.Check(zap.DebugLevel, "Log record copies not sent: the replay was canceled"); ce != nil {
+				ce.Write(zap.Error(err))
+			}
+			return
 		}
-		return
+		c.tel.recordReplay(ctx, chunks[i].sent, err)
+		if err != nil {
+			ok = false
+			c.logDownstreamError(err)
+		}
 	}
-	c.tel.recordReplay(ctx, sent, err)
-	if err != nil {
-		c.logDownstreamError(err)
+	if ok {
+		c.state.setLastReplay(ts.AsTime().UnixNano())
+		c.changed()
 	}
+}
+
+// checkSources sorts the kept records by their source file: live (the file
+// exists), gone (the file is missing at two checks, sourceRecheckDelay
+// apart), and skipped (a check failed for another reason, so the record is
+// not sent and stays kept). live keeps the order of kept. If ctx ends
+// during the wait, no record is gone.
+func (c *replayConnector) checkSources(ctx context.Context, kept []keptEntry) ([]keptEntry, []keptEntry, []skip) {
+	var live, missing, gone []keptEntry
+	var skipped []skip
+	sortOut := func(k keptEntry, notExist *[]keptEntry) {
+		switch err := c.checkSource(k.entry.SourceFile); {
+		case err == nil:
+			live = append(live, k)
+		case errors.Is(err, fs.ErrNotExist):
+			*notExist = append(*notExist, k)
+		default:
+			skipped = append(skipped, skip{rule: k.rule, reason: skipSourceCheckError})
+			c.logSourceError(c.rules[k.rule].cfg.Name, k.entry.SourceFile, err)
+		}
+	}
+	for _, k := range kept {
+		sortOut(k, &missing)
+	}
+	if len(missing) == 0 {
+		return live, nil, skipped
+	}
+	if c.recheckDelay > 0 {
+		timer := time.NewTimer(c.recheckDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return live, nil, skipped
+		case <-timer.C:
+		}
+	}
+	for _, k := range missing {
+		sortOut(k, &gone)
+	}
+	slices.SortFunc(live, func(a, b keptEntry) int {
+		return cmp.Or(cmp.Compare(a.rule, b.rule), cmp.Compare(a.key, b.key))
+	})
+	return live, gone, skipped
 }
 
 // setTimes sets the timestamp and the observed timestamp of every record of
